@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-13
+
+### Added
+
+- **Intent Solutions testing harness baseline** (audit-harness v0.1.0, vendored at `.audit-harness/` with wrapper at `scripts/audit-harness`). Adds hash-pinning, escape-scan, CRAP, architecture, bias, and Gherkin-lint primitives as deterministic in-repo scripts so testing-policy enforcement travels with the code (never references `~/.claude/` paths from hooks or CI). Per-repo baseline notes in `000-docs/audit-harness-test-baseline-2026-05-01.md`. Upgrade in place via `AUDIT_HARNESS_VERSION=vX.Y.Z curl -sSL https://raw.githubusercontent.com/jeremylongshore/audit-harness/main/install.sh | bash`.
+
+### Changed
+
+- **Removed `gemini-review.yml` workflow** — Gemini PR review now runs via the GitHub App, not an in-repo workflow. Reduces CI surface area and removes the workflow-side maintenance burden.
+- **`.gitleaks.toml` allowlist for `.beads/` memory and GHSA-* advisory IDs** — replaces fingerprint-by-fingerprint exemptions with structural path + regex allowlists so future bd memory additions and GHSA citations don't trip the secrets scan.
+- **CI dep maintenance**: `github/codeql-action` 4.35.2 → 4.35.4 (dependabot).
+
 ### Fixed
 
 - **`reply` tool — pass `filename` to Slack file uploads**. `server.ts` was calling `WebClient.filesUploadV2()` with `{ channel_id, file: <absolute path> }` but never setting `filename`. The `@slack/web-api` v2 upload flow does not infer the filename from the `file` path when it's a string — Slack defaults to `file.txt`, which means every uploaded asset (PNG, HTML, MD, PDF, etc.) was delivered to recipients as a `.txt` download with the wrong mimetype. Adds `filename: basename(resolved)` to the upload args so the original filename and inferred mimetype are preserved end-to-end. Imports `basename` from `node:path` (already imports `resolve` from the same module).
