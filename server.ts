@@ -47,6 +47,7 @@ import {
   deliveredThreadKey as libDeliveredThreadKey,
   gate as libGate,
   listSessions as libListSessions,
+  loadOwnThreads,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -54,6 +55,7 @@ import {
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
+  recordOwnPostTs,
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
@@ -130,6 +132,7 @@ const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'cha
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const OWN_THREADS_FILE = join(STATE_DIR, 'own-threads.json')
 const DEFAULT_CHUNK_LIMIT = 4000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
@@ -154,6 +157,7 @@ try {
 
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
+const ownPostedTimestamps = loadOwnThreads(OWN_THREADS_FILE)
 
 function loadEnv(): { botToken: string; appToken: string } {
   if (!existsSync(ENV_FILE)) {
@@ -587,6 +591,7 @@ async function gate(event: unknown): Promise<GateResult> {
     botUserId,
     selfBotId,
     selfAppId,
+    ownPostedTimestamps,
   })
 }
 
@@ -963,6 +968,10 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
       unfurl_media: false,
     })
     lastTs = (res.ts as string) || lastTs
+  }
+
+  if (lastTs && !threadTs) {
+    recordOwnPostTs(ownPostedTimestamps, lastTs, OWN_THREADS_FILE)
   }
 
   // Upload files if provided

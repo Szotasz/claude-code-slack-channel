@@ -9,7 +9,15 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { basename, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
@@ -63,6 +71,10 @@ export interface ChannelPolicy {
    *  (redaction lives in the 30-A journal layer). Projection failures
    *  are log-only and never block tool execution. */
   audit?: AuditMode
+  /** Auto-deliver thread replies to the bot's own posted messages even
+   *  when requireMention is true. Absent or `true` = enabled (opt-out).
+   *  Set to `false` to require @-mention even for thread replies. */
+  threadReplyAuto?: boolean
 }
 
 export interface PendingEntry {
@@ -1118,6 +1130,10 @@ export interface GateOptions {
   selfBotId: string
   /** App ID from auth.test (matches ev.bot_profile.app_id for self-echo in multi-workspace) */
   selfAppId: string
+  /** Timestamps of messages the bot itself posted. Thread replies whose
+   *  thread_ts matches an entry bypass requireMention (unless the channel
+   *  policy sets threadReplyAuto: false). Managed by the server layer. */
+  ownPostedTimestamps?: ReadonlySet<string>
 }
 
 /**
@@ -1221,7 +1237,12 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
   }
 
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
-    return { action: 'drop' }
+    const threadTs = ev.thread_ts as string | undefined
+    const autoDeliver =
+      policy.threadReplyAuto !== false &&
+      threadTs !== undefined &&
+      opts.ownPostedTimestamps?.has(threadTs) === true
+    if (!autoDeliver) return { action: 'drop' }
   }
 
   return { action: 'deliver', access }
@@ -1253,6 +1274,49 @@ function isMentioned(event: Record<string, unknown>, botUserId: string): boolean
   if (!botUserId) return false
   const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
+}
+
+// ---------------------------------------------------------------------------
+// Own-posted timestamp tracking (thread-reply auto-deliver)
+// ---------------------------------------------------------------------------
+
+export const OWN_THREADS_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+interface OwnThreadEntry {
+  ts: string
+  createdAt: number
+}
+
+export function loadOwnThreads(filePath: string): Set<string> {
+  try {
+    const raw = readFileSync(filePath, 'utf-8')
+    const entries: OwnThreadEntry[] = JSON.parse(raw)
+    const now = Date.now()
+    const live = entries.filter((e) => now - e.createdAt < OWN_THREADS_TTL_MS)
+    return new Set(live.map((e) => e.ts))
+  } catch {
+    return new Set()
+  }
+}
+
+export function saveOwnThreads(filePath: string, timestamps: ReadonlySet<string>): void {
+  const now = Date.now()
+  let existing: OwnThreadEntry[] = []
+  try {
+    existing = JSON.parse(readFileSync(filePath, 'utf-8'))
+  } catch {}
+  const known = new Map(existing.map((e) => [e.ts, e.createdAt]))
+  const entries: OwnThreadEntry[] = []
+  for (const ts of timestamps) {
+    entries.push({ ts, createdAt: known.get(ts) ?? now })
+  }
+  const pruned = entries.filter((e) => now - e.createdAt < OWN_THREADS_TTL_MS)
+  writeFileSync(filePath, `${JSON.stringify(pruned, null, 2)}\n`)
+}
+
+export function recordOwnPostTs(timestamps: Set<string>, ts: string, filePath: string): void {
+  timestamps.add(ts)
+  saveOwnThreads(filePath, timestamps)
 }
 
 // ---------------------------------------------------------------------------

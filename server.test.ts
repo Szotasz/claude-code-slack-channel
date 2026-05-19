@@ -38,20 +38,24 @@ import {
   generateCorrelationId,
   isDuplicateEvent,
   isSlackFileUrl,
+  loadOwnThreads,
   loadSession,
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
   migrateFlatSessions,
+  OWN_THREADS_TTL_MS,
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
   parseSendableRoots,
   pruneExpired,
+  recordOwnPostTs,
   resolveJournalPath,
   type Session,
   type SessionKey,
   sanitizeDisplayName,
   sanitizeFilename,
+  saveOwnThreads,
   saveSession,
   sessionPath,
   shouldPostAuditReceipt,
@@ -514,6 +518,113 @@ describe('gate', () => {
     // the global access.allowFrom check at server.ts:704/876 would block it
     // because U_PEER is not in access.allowFrom. This test verifies the
     // belt-and-suspenders gate-level check catches it first.
+  })
+
+  // -- threadReplyAuto: bypass requireMention for thread replies to own posts --
+
+  test('delivers thread reply to own post when requireMention is true (threadReplyAuto default)', async () => {
+    const ownTs = new Set(['1711000000.000100'])
+    const access = makeAccess({
+      channels: { C_THR: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_THR',
+        channel_type: 'channel',
+        text: 'replying without mention',
+        thread_ts: '1711000000.000100',
+      },
+      makeOpts({ access, ownPostedTimestamps: ownTs }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('drops thread reply when thread_ts is NOT an own-posted timestamp', async () => {
+    const ownTs = new Set(['1711000000.000100'])
+    const access = makeAccess({
+      channels: { C_THR: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_THR',
+        channel_type: 'channel',
+        text: 'replying to someone else thread',
+        thread_ts: '1711000000.999999',
+      },
+      makeOpts({ access, ownPostedTimestamps: ownTs }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('drops thread reply when ownPostedTimestamps is absent', async () => {
+    const access = makeAccess({
+      channels: { C_THR: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_THR',
+        channel_type: 'channel',
+        text: 'reply',
+        thread_ts: '1711000000.000100',
+      },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('drops thread reply when threadReplyAuto is explicitly false', async () => {
+    const ownTs = new Set(['1711000000.000100'])
+    const access = makeAccess({
+      channels: { C_THR: { requireMention: true, allowFrom: [], threadReplyAuto: false } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_THR',
+        channel_type: 'channel',
+        text: 'reply',
+        thread_ts: '1711000000.000100',
+      },
+      makeOpts({ access, ownPostedTimestamps: ownTs }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('delivers non-threaded message normally when requireMention is false (threadReplyAuto irrelevant)', async () => {
+    const access = makeAccess({
+      channels: { C_THR: { requireMention: false, allowFrom: [] } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_THR',
+        channel_type: 'channel',
+        text: 'top-level message',
+      },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('thread reply to own post still requires allowFrom when set', async () => {
+    const ownTs = new Set(['1711000000.000100'])
+    const access = makeAccess({
+      channels: { C_THR: { requireMention: true, allowFrom: ['U_VIP'], threadReplyAuto: true } },
+    })
+    const result = await gate(
+      {
+        user: 'U_NOBODY',
+        channel: 'C_THR',
+        channel_type: 'channel',
+        text: 'reply',
+        thread_ts: '1711000000.000100',
+      },
+      makeOpts({ access, ownPostedTimestamps: ownTs }),
+    )
+    expect(result.action).toBe('drop')
   })
 
   // -- Epic 30-B.8: audit-receipt self-echo regression --
@@ -1517,6 +1628,72 @@ describe('defaultAccess', () => {
 
   test('returns empty pending', () => {
     expect(defaultAccess().pending).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// own-threads persistence (thread-reply auto-deliver)
+// ---------------------------------------------------------------------------
+
+describe('loadOwnThreads / saveOwnThreads / recordOwnPostTs', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'own-threads-'))
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('loadOwnThreads returns empty set for missing file', () => {
+    const result = loadOwnThreads(join(tmpDir, 'nope.json'))
+    expect(result.size).toBe(0)
+  })
+
+  test('saveOwnThreads + loadOwnThreads round-trip', () => {
+    const file = join(tmpDir, 'own-threads.json')
+    const ts = new Set(['1711000000.000100', '1711000000.000200'])
+    saveOwnThreads(file, ts)
+    const loaded = loadOwnThreads(file)
+    expect(loaded.size).toBe(2)
+    expect(loaded.has('1711000000.000100')).toBe(true)
+    expect(loaded.has('1711000000.000200')).toBe(true)
+  })
+
+  test('loadOwnThreads prunes entries older than TTL', () => {
+    const file = join(tmpDir, 'own-threads.json')
+    const old = Date.now() - OWN_THREADS_TTL_MS - 1000
+    writeFileSync(
+      file,
+      JSON.stringify([
+        { ts: '1711000000.000100', createdAt: old },
+        { ts: '1711000000.000200', createdAt: Date.now() },
+      ]),
+    )
+    const loaded = loadOwnThreads(file)
+    expect(loaded.size).toBe(1)
+    expect(loaded.has('1711000000.000200')).toBe(true)
+  })
+
+  test('recordOwnPostTs adds ts and persists', () => {
+    const file = join(tmpDir, 'own-threads.json')
+    const set = new Set<string>()
+    recordOwnPostTs(set, '1711000000.000100', file)
+    expect(set.has('1711000000.000100')).toBe(true)
+    const loaded = loadOwnThreads(file)
+    expect(loaded.has('1711000000.000100')).toBe(true)
+  })
+
+  test('saveOwnThreads preserves existing createdAt on re-save', () => {
+    const file = join(tmpDir, 'own-threads.json')
+    const past = Date.now() - 3600_000
+    writeFileSync(file, JSON.stringify([{ ts: '1711000000.000100', createdAt: past }]))
+    const ts = new Set(['1711000000.000100', '1711000000.000200'])
+    saveOwnThreads(file, ts)
+    const raw = JSON.parse(readFileSync(file, 'utf-8'))
+    const entry100 = raw.find((e: any) => e.ts === '1711000000.000100')
+    expect(entry100.createdAt).toBe(past)
   })
 })
 
