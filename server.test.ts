@@ -1695,6 +1695,23 @@ describe('loadOwnThreads / saveOwnThreads / recordOwnPostTs', () => {
     const entry100 = raw.find((e: any) => e.ts === '1711000000.000100')
     expect(entry100.createdAt).toBe(past)
   })
+
+  test('saveOwnThreads writes file with 0o600 permissions', () => {
+    const file = join(tmpDir, 'own-threads.json')
+    const ts = new Set(['1711000000.000100'])
+    saveOwnThreads(file, ts)
+    const mode = statSync(file).mode & 0o777
+    expect(mode).toBe(0o600)
+  })
+
+  test('saveOwnThreads is atomic (no partial file on concurrent read)', () => {
+    const file = join(tmpDir, 'own-threads.json')
+    saveOwnThreads(file, new Set(['1711000000.000100']))
+    saveOwnThreads(file, new Set(['1711000000.000100', '1711000000.000200']))
+    const loaded = loadOwnThreads(file)
+    expect(loaded.size).toBe(2)
+    expect(existsSync(`${file}.tmp.${process.pid}`)).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------

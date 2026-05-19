@@ -10,12 +10,15 @@
 
 import { randomBytes } from 'node:crypto'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
@@ -1311,7 +1314,21 @@ export function saveOwnThreads(filePath: string, timestamps: ReadonlySet<string>
     entries.push({ ts, createdAt: known.get(ts) ?? now })
   }
   const pruned = entries.filter((e) => now - e.createdAt < OWN_THREADS_TTL_MS)
-  writeFileSync(filePath, `${JSON.stringify(pruned, null, 2)}\n`)
+  const json = `${JSON.stringify(pruned, null, 2)}\n`
+  const tmp = `${filePath}.tmp.${process.pid}`
+  try {
+    unlinkSync(tmp)
+  } catch {}
+  try {
+    writeFileSync(tmp, json, { mode: 0o600, flag: 'wx' })
+    chmodSync(tmp, 0o600)
+    renameSync(tmp, filePath)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {}
+    throw err
+  }
 }
 
 export function recordOwnPostTs(timestamps: Set<string>, ts: string, filePath: string): void {
