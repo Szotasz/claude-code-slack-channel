@@ -81,11 +81,14 @@ export interface ChannelPolicy {
   /** Only meaningful when requireMention is false (the bot reads every
    *  message). A message that @-mentions someone ELSE and not this bot is
    *  addressed to them, so it is dropped: "@Iris do it" in a channel where
-   *  Zara reads everything reaches Iris only. Absent or `true` = enabled;
-   *  `false` = deliver every message as before. */
+   *  Zara reads everything reaches Iris only. Absent = ON only when
+   *  mentionPeers is non-empty, so an existing channel keeps delivering
+   *  exactly as before until it is configured; `true` = on (any other mention
+   *  counts when there are no peers); `false` = off. */
   skipWhenOthersMentioned?: boolean
-  /** Narrows skipWhenOthersMentioned to these user IDs (e.g. the other agents'
-   *  bot users). Absent or empty = ANY other mention counts, humans included. */
+  /** The user IDs whose mention means "not for this bot" (e.g. the other
+   *  agents' bot users). Setting it turns the rule on by default. A mention
+   *  of anyone NOT on the list (a human colleague) still reaches the bot. */
   mentionPeers?: string[]
 }
 
@@ -1257,9 +1260,10 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     if (!autoDeliver) return { action: 'drop' }
   }
 
+  const skipOthers = policy.skipWhenOthersMentioned ?? (policy.mentionPeers?.length ?? 0) > 0
   if (
     !policy.requireMention &&
-    policy.skipWhenOthersMentioned !== false &&
+    skipOthers &&
     addressedToOthers(ev, botUserId, policy.mentionPeers)
   ) {
     return { action: 'drop' }
@@ -1309,9 +1313,12 @@ export function addressedToOthers(
   botUserId: string,
   peers?: readonly string[],
 ): boolean {
+  // Unknown own identity (auth.test failed at startup): we cannot tell "us"
+  // from "them", so fail OPEN to the old behaviour -- never drop.
+  if (!botUserId) return false
   const ids = mentionedUserIds((event.text as string | undefined) || '')
   if (ids.length === 0) return false
-  if (botUserId && ids.includes(botUserId)) return false
+  if (ids.includes(botUserId)) return false
   const others = ids.filter((id) => id !== botUserId)
   if (peers && peers.length > 0) return others.some((id) => peers.includes(id))
   return others.length > 0
