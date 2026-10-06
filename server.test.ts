@@ -21,6 +21,7 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  addressedToOthers,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
@@ -34,8 +35,6 @@ import {
   escMrkdwn,
   type GateOptions,
   gate,
-  addressedToOthers,
-  mentionedUserIds,
   generateCode,
   generateCorrelationId,
   isDuplicateEvent,
@@ -45,6 +44,7 @@ import {
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
+  mentionedUserIds,
   migrateFlatSessions,
   OWN_THREADS_TTL_MS,
   PAIRING_EXPIRY_MS,
@@ -10304,7 +10304,12 @@ describe('mapAcpSessionCancel (ccsc-21x)', () => {
 describe('skipWhenOthersMentioned', () => {
   const ch = (policy: Record<string, unknown>) =>
     makeAccess({ channels: { C_MKT: { requireMention: false, allowFrom: [], ...policy } } })
-  const msg = (text: string) => ({ user: 'U_OWNER', channel: 'C_MKT', channel_type: 'channel', text })
+  const msg = (text: string) => ({
+    user: 'U_OWNER',
+    channel: 'C_MKT',
+    channel_type: 'channel',
+    text,
+  })
 
   test('mentionedUserIds parses plain and labelled mentions, once each', () => {
     expect(mentionedUserIds('<@U_A> hi <@U_B|iris> and <@U_A>')).toEqual(['U_A', 'U_B'])
@@ -10332,26 +10337,39 @@ describe('skipWhenOthersMentioned', () => {
   })
 
   test('skipWhenOthersMentioned: false restores delivering everything', async () => {
-    const r = await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access: ch({ skipWhenOthersMentioned: false }) }))
+    const r = await gate(
+      msg('<@U_IRIS> csinald meg'),
+      makeOpts({ access: ch({ skipWhenOthersMentioned: false }) }),
+    )
     expect(r.action).toBe('deliver')
   })
 
   test('with mentionPeers, only a PEER mention drops; a human mention passes', async () => {
     const access = ch({ mentionPeers: ['U_IRIS'] })
     expect((await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access }))).action).toBe('drop')
-    expect((await gate(msg('<@U_PETER> mit gondolsz?'), makeOpts({ access }))).action).toBe('deliver')
+    expect((await gate(msg('<@U_PETER> mit gondolsz?'), makeOpts({ access }))).action).toBe(
+      'deliver',
+    )
   })
 
   test('requireMention: true channels are unaffected (the mention gate already decides)', async () => {
     const access = makeAccess({ channels: { C_MKT: { requireMention: true, allowFrom: [] } } })
-    expect((await gate(msg('<@U_BOT> <@U_IRIS> mindketten'), makeOpts({ access }))).action).toBe('deliver')
+    expect((await gate(msg('<@U_BOT> <@U_IRIS> mindketten'), makeOpts({ access }))).action).toBe(
+      'deliver',
+    )
     expect((await gate(msg('<@U_IRIS> csak te'), makeOpts({ access }))).action).toBe('drop')
   })
 
   test('requireMention: true + an auto-delivered thread reply to our own post that tags someone else still arrives (scope: read-everything channels only)', async () => {
     const access = makeAccess({ channels: { C_MKT: { requireMention: true, allowFrom: [] } } })
     const r = await gate(
-      { user: 'U_OWNER', channel: 'C_MKT', channel_type: 'channel', text: '<@U_IRIS> nezd meg te is', thread_ts: '1711000000.000100' },
+      {
+        user: 'U_OWNER',
+        channel: 'C_MKT',
+        channel_type: 'channel',
+        text: '<@U_IRIS> nezd meg te is',
+        thread_ts: '1711000000.000100',
+      },
       makeOpts({ access, ownPostedTimestamps: new Set(['1711000000.000100']) }),
     )
     expect(r.action).toBe('deliver')

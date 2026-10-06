@@ -1257,7 +1257,11 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     if (!autoDeliver) return { action: 'drop' }
   }
 
-  if (!policy.requireMention && policy.skipWhenOthersMentioned !== false && addressedToOthers(ev, botUserId, policy.mentionPeers)) {
+  if (
+    !policy.requireMention &&
+    policy.skipWhenOthersMentioned !== false &&
+    addressedToOthers(ev, botUserId, policy.mentionPeers)
+  ) {
     return { action: 'drop' }
   }
 
