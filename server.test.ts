@@ -21,6 +21,7 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  addressedToOthers,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
@@ -43,6 +44,7 @@ import {
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
+  mentionedUserIds,
   migrateFlatSessions,
   OWN_THREADS_TTL_MS,
   PAIRING_EXPIRY_MS,
@@ -10291,5 +10293,106 @@ describe('mapAcpSessionCancel (ccsc-21x)', () => {
       channel: 'D0123456789',
       thread: '1711999999.000042',
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// skipWhenOthersMentioned: a read-everything bot leaves messages addressed to
+// someone else alone (SLACKMENTION1006, owner request 2026-10-06).
+// ---------------------------------------------------------------------------
+
+describe('skipWhenOthersMentioned', () => {
+  const ch = (policy: Record<string, unknown>) =>
+    makeAccess({ channels: { C_MKT: { requireMention: false, allowFrom: [], ...policy } } })
+  const msg = (text: string) => ({
+    user: 'U_OWNER',
+    channel: 'C_MKT',
+    channel_type: 'channel',
+    text,
+  })
+  const PEERS = { mentionPeers: ['U_IRIS'] }
+
+  test('mentionedUserIds parses plain and labelled mentions, once each', () => {
+    expect(mentionedUserIds('<@U_A> hi <@U_B|iris> and <@U_A>')).toEqual(['U_A', 'U_B'])
+    expect(mentionedUserIds('no mention, <#C1|chan>, <!here>')).toEqual([])
+  })
+
+  test('an UNCONFIGURED channel is unchanged by the deploy: a tag of someone else still arrives', async () => {
+    const r = await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access: ch({}) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('with mentionPeers (on by default): a message tagging a PEER and not this bot is dropped', async () => {
+    const r = await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('drop')
+  })
+
+  test('with mentionPeers: a human colleague tag still arrives', async () => {
+    const r = await gate(msg('<@U_PETER> mit gondolsz?'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('with mentionPeers: a message with no mention at all arrives (read-everything still works)', async () => {
+    const r = await gate(msg('mi a helyzet a kampannyal?'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('with mentionPeers: this bot tagged too, next to a peer -> arrives', async () => {
+    const r = await gate(
+      msg('<@U_IRIS> <@U_BOT> beszeljetek ossze'),
+      makeOpts({ access: ch(PEERS) }),
+    )
+    expect(r.action).toBe('deliver')
+  })
+
+  test('with mentionPeers: only this bot tagged -> arrives', async () => {
+    const r = await gate(msg('<@U_BOT> te csinald'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('skipWhenOthersMentioned: true without peers drops ANY other mention, humans included', async () => {
+    const access = ch({ skipWhenOthersMentioned: true })
+    expect((await gate(msg('<@U_PETER> mit gondolsz?'), makeOpts({ access }))).action).toBe('drop')
+  })
+
+  test('skipWhenOthersMentioned: false turns it off even with peers', async () => {
+    const access = ch({ ...PEERS, skipWhenOthersMentioned: false })
+    expect((await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access }))).action).toBe('deliver')
+  })
+
+  test('requireMention: true channels are unaffected (the mention gate already decides)', async () => {
+    const access = makeAccess({
+      channels: { C_MKT: { requireMention: true, allowFrom: [], ...PEERS } },
+    })
+    expect((await gate(msg('<@U_BOT> <@U_IRIS> mindketten'), makeOpts({ access }))).action).toBe(
+      'deliver',
+    )
+    expect((await gate(msg('<@U_IRIS> csak te'), makeOpts({ access }))).action).toBe('drop')
+  })
+
+  test('requireMention: true + an auto-delivered thread reply to our own post that tags a peer still arrives', async () => {
+    const access = makeAccess({
+      channels: { C_MKT: { requireMention: true, allowFrom: [], ...PEERS } },
+    })
+    const r = await gate(
+      {
+        user: 'U_OWNER',
+        channel: 'C_MKT',
+        channel_type: 'channel',
+        text: '<@U_IRIS> nezd meg te is',
+        thread_ts: '1711000000.000100',
+      },
+      makeOpts({ access, ownPostedTimestamps: new Set(['1711000000.000100']) }),
+    )
+    expect(r.action).toBe('deliver')
+  })
+
+  test('unknown own identity (auth.test failed, botUserId empty) fails OPEN: nothing is dropped', async () => {
+    expect(addressedToOthers({ text: '<@U_IRIS> hello' }, '', ['U_IRIS'])).toBe(false)
+    const r = await gate(
+      msg('<@U_IRIS> csinald meg'),
+      makeOpts({ access: ch(PEERS), botUserId: '' }),
+    )
+    expect(r.action).toBe('deliver')
   })
 })

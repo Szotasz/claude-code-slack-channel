@@ -78,6 +78,18 @@ export interface ChannelPolicy {
    *  when requireMention is true. Absent or `true` = enabled (opt-out).
    *  Set to `false` to require @-mention even for thread replies. */
   threadReplyAuto?: boolean
+  /** Only meaningful when requireMention is false (the bot reads every
+   *  message). A message that @-mentions someone ELSE and not this bot is
+   *  addressed to them, so it is dropped: "@Iris do it" in a channel where
+   *  Zara reads everything reaches Iris only. Absent = ON only when
+   *  mentionPeers is non-empty, so an existing channel keeps delivering
+   *  exactly as before until it is configured; `true` = on (any other mention
+   *  counts when there are no peers); `false` = off. */
+  skipWhenOthersMentioned?: boolean
+  /** The user IDs whose mention means "not for this bot" (e.g. the other
+   *  agents' bot users). Setting it turns the rule on by default. A mention
+   *  of anyone NOT on the list (a human colleague) still reaches the bot. */
+  mentionPeers?: string[]
 }
 
 export interface PendingEntry {
@@ -1248,6 +1260,15 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     if (!autoDeliver) return { action: 'drop' }
   }
 
+  const skipOthers = policy.skipWhenOthersMentioned ?? (policy.mentionPeers?.length ?? 0) > 0
+  if (
+    !policy.requireMention &&
+    skipOthers &&
+    addressedToOthers(ev, botUserId, policy.mentionPeers)
+  ) {
+    return { action: 'drop' }
+  }
+
   return { action: 'deliver', access }
 }
 
@@ -1271,6 +1292,36 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
 
   // 5. Channel handling — opt-in per channel ID
   return handleChannelEvent(ev, opts)
+}
+
+/** User IDs @-mentioned in the message text (`<@U123>` or `<@U123|name>`). */
+export function mentionedUserIds(text: string): string[] {
+  const out: string[] = []
+  for (const m of text.matchAll(/<@([UW][A-Z0-9_]+)(?:\|[^>]*)?>/g)) {
+    if (!out.includes(m[1])) out.push(m[1])
+  }
+  return out
+}
+
+/**
+ * True when the message names someone else and not this bot: it is meant for
+ * them. A message that also mentions this bot is never "for others". With a
+ * peer list, only mentions of those peers count (a human mention then passes).
+ */
+export function addressedToOthers(
+  event: Record<string, unknown>,
+  botUserId: string,
+  peers?: readonly string[],
+): boolean {
+  // Unknown own identity (auth.test failed at startup): we cannot tell "us"
+  // from "them", so fail OPEN to the old behaviour -- never drop.
+  if (!botUserId) return false
+  const ids = mentionedUserIds((event.text as string | undefined) || '')
+  if (ids.length === 0) return false
+  if (ids.includes(botUserId)) return false
+  const others = ids.filter((id) => id !== botUserId)
+  if (peers && peers.length > 0) return others.some((id) => peers.includes(id))
+  return others.length > 0
 }
 
 function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
