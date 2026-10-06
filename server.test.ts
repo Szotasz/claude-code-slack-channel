@@ -34,6 +34,8 @@ import {
   escMrkdwn,
   type GateOptions,
   gate,
+  addressedToOthers,
+  mentionedUserIds,
   generateCode,
   generateCorrelationId,
   isDuplicateEvent,
@@ -10291,5 +10293,72 @@ describe('mapAcpSessionCancel (ccsc-21x)', () => {
       channel: 'D0123456789',
       thread: '1711999999.000042',
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// skipWhenOthersMentioned: a read-everything bot leaves messages addressed to
+// someone else alone (SLACKMENTION1006, owner request 2026-10-06).
+// ---------------------------------------------------------------------------
+
+describe('skipWhenOthersMentioned', () => {
+  const ch = (policy: Record<string, unknown>) =>
+    makeAccess({ channels: { C_MKT: { requireMention: false, allowFrom: [], ...policy } } })
+  const msg = (text: string) => ({ user: 'U_OWNER', channel: 'C_MKT', channel_type: 'channel', text })
+
+  test('mentionedUserIds parses plain and labelled mentions, once each', () => {
+    expect(mentionedUserIds('<@U_A> hi <@U_B|iris> and <@U_A>')).toEqual(['U_A', 'U_B'])
+    expect(mentionedUserIds('no mention, <#C1|chan>, <!here>')).toEqual([])
+  })
+
+  test('drops a message that tags ANOTHER bot and not this one (default on)', async () => {
+    const r = await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access: ch({}) }))
+    expect(r.action).toBe('drop')
+  })
+
+  test('delivers a message with no mention at all (the read-everything mode still works)', async () => {
+    const r = await gate(msg('mi a helyzet a kampannyal?'), makeOpts({ access: ch({}) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('delivers when this bot is tagged too, even next to others', async () => {
+    const r = await gate(msg('<@U_IRIS> <@U_BOT> beszeljetek ossze'), makeOpts({ access: ch({}) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('delivers a message tagging only this bot', async () => {
+    const r = await gate(msg('<@U_BOT> te csinald'), makeOpts({ access: ch({}) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('skipWhenOthersMentioned: false restores delivering everything', async () => {
+    const r = await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access: ch({ skipWhenOthersMentioned: false }) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('with mentionPeers, only a PEER mention drops; a human mention passes', async () => {
+    const access = ch({ mentionPeers: ['U_IRIS'] })
+    expect((await gate(msg('<@U_IRIS> csinald meg'), makeOpts({ access }))).action).toBe('drop')
+    expect((await gate(msg('<@U_PETER> mit gondolsz?'), makeOpts({ access }))).action).toBe('deliver')
+  })
+
+  test('requireMention: true channels are unaffected (the mention gate already decides)', async () => {
+    const access = makeAccess({ channels: { C_MKT: { requireMention: true, allowFrom: [] } } })
+    expect((await gate(msg('<@U_BOT> <@U_IRIS> mindketten'), makeOpts({ access }))).action).toBe('deliver')
+    expect((await gate(msg('<@U_IRIS> csak te'), makeOpts({ access }))).action).toBe('drop')
+  })
+
+  test('requireMention: true + an auto-delivered thread reply to our own post that tags someone else still arrives (scope: read-everything channels only)', async () => {
+    const access = makeAccess({ channels: { C_MKT: { requireMention: true, allowFrom: [] } } })
+    const r = await gate(
+      { user: 'U_OWNER', channel: 'C_MKT', channel_type: 'channel', text: '<@U_IRIS> nezd meg te is', thread_ts: '1711000000.000100' },
+      makeOpts({ access, ownPostedTimestamps: new Set(['1711000000.000100']) }),
+    )
+    expect(r.action).toBe('deliver')
+  })
+
+  test('addressedToOthers is false without a bot user id only when nothing is mentioned', () => {
+    expect(addressedToOthers({ text: 'hello' }, '')).toBe(false)
+    expect(addressedToOthers({ text: '<@U_X> hello' }, '')).toBe(true)
   })
 })
