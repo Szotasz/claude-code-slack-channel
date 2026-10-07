@@ -31,6 +31,7 @@ import {
   assertPublishAllowed,
   buildAndPostAuditReceipt,
   chunkText,
+  createDmOwnerResolver,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -519,6 +520,21 @@ function assertSendable(filePath: string): void {
 // enforce thread-level isolation per session-state-machine.md §207.
 const deliveredThreads = new Set<string>()
 
+// SLACKOUTDM1007: DM channel -> its user, so an allowFrom user's DM stays an
+// outbound target after a restart (see assertOutboundAllowed in lib.ts). Learned
+// for free from inbound DMs, otherwise looked up once per DM via
+// conversations.info (needs im:read; on error nothing is learned and the gate
+// refuses as before).
+const dmOwners = createDmOwnerResolver(
+  (args) => web.conversations.info(args),
+  (chatId, err) => {
+    console.error('[slack] DM owner lookup failed', {
+      channel: chatId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  },
+)
+
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
 const seenEvents = new Map<string, number>()
@@ -555,7 +571,25 @@ let reaperTimer: ReturnType<typeof setInterval> | null = null
 let lastActiveChannel = ''
 let lastActiveThread: string | undefined
 
-function assertOutboundAllowed(chatId: string, threadTs: string | undefined): void {
+async function assertOutboundAllowed(chatId: string, threadTs: string | undefined): Promise<void> {
+  try {
+    libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)
+    return
+  } catch (err) {
+    // Not allowed on what we know. If it is a DM we have not seen yet, learn
+    // its user once and decide again; anything else keeps the refusal.
+    await dmOwners.resolve(chatId)
+    if (!dmOwners.owners.has(chatId)) throw err
+  }
+  libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)
+}
+
+// The pre-SLACKOUTDM1007 gate, with no allowFrom-DM path. Kept on purpose for
+// (1) the permission relay, whose target is lastActiveChannel (set only by an
+// inbound message, so already in deliveredThreads) or the first opted-in
+// channel, and whose behaviour is not part of this change; and (2) the manifest
+// tools, which pin and read pins in an opted-in channel only.
+function assertOutboundAllowedNoDm(chatId: string, threadTs: string | undefined): void {
   libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads)
 }
 
@@ -902,7 +936,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 interface ToolContext {
   web: WebClient
   botToken: string
-  assertOutboundAllowed: (chatId: string, threadTs: string | undefined) => void
+  assertOutboundAllowed: (chatId: string, threadTs: string | undefined) => Promise<void>
+  /** The pre-SLACKOUTDM1007 gate (opted-in channel or delivered thread, no
+   *  allowFrom-DM path), for the manifest tools, which pin and read pins in
+   *  an opted-in channel and must not start doing so in a DM. */
+  assertOutboundAllowedNoDm: (chatId: string, threadTs: string | undefined) => void
   assertSendable: (filePath: string) => void
   journalWrite: (input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0]) => void
   getAccess: () => import('./lib.ts').Access
@@ -933,7 +971,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const files: string[] | undefined = args.files
 
   try {
-    ctx.assertOutboundAllowed(chatId, threadTs)
+    await ctx.assertOutboundAllowed(chatId, threadTs)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1019,7 +1057,7 @@ async function executeReact(args: Record<string, any>, ctx: ToolContext): Promis
   // omitted, fall back to channel-level opt-in or top-level
   // delivery by passing undefined.
   try {
-    ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
+    await ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1063,7 +1101,7 @@ async function executeEditMessage(
   // in. Callers that know the thread pass `thread_ts`; otherwise
   // the gate falls back to channel-level opt-in or top-level.
   try {
-    ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
+    await ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1107,7 +1145,7 @@ async function executeFetchMessages(
   const threadTs: string | undefined = args.thread_ts
   const limit = Math.min(args.limit || 20, 100)
   try {
-    ctx.assertOutboundAllowed(channel, threadTs)
+    await ctx.assertOutboundAllowed(channel, threadTs)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1180,7 +1218,7 @@ async function executeDownloadAttachment(
   // in. Callers that know the thread pass `thread_ts`; the gate
   // falls back to channel-level opt-in or top-level otherwise.
   try {
-    ctx.assertOutboundAllowed(channel, args.thread_ts)
+    await ctx.assertOutboundAllowed(channel, args.thread_ts)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1307,7 +1345,7 @@ async function executeReadPeerManifests(
   // must not open a path into a channel that the bot does not already
   // participate in. No new surface; just the existing opt-in list.
   try {
-    ctx.assertOutboundAllowed(channel, undefined)
+    ctx.assertOutboundAllowedNoDm(channel, undefined)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1515,7 +1553,7 @@ function executePublishManifestGate2(
   ctx: ToolContext,
 ): void {
   try {
-    ctx.assertOutboundAllowed(channel, undefined)
+    ctx.assertOutboundAllowedNoDm(channel, undefined)
   } catch (outboundErr) {
     ctx.journalWrite({
       kind: 'gate.outbound.deny',
@@ -1660,6 +1698,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       web,
       botToken,
       assertOutboundAllowed,
+      assertOutboundAllowedNoDm,
       assertSendable,
       journalWrite,
       getAccess,
@@ -1761,7 +1800,7 @@ mcp.setNotificationHandler(
     // from. Falls back to top-level only when we're using an opted-in
     // channel with no active thread (lastActiveThread === undefined).
     try {
-      assertOutboundAllowed(targetChannel, lastActiveThread)
+      assertOutboundAllowedNoDm(targetChannel, lastActiveThread)
     } catch (outboundErr) {
       journalWrite({
         kind: 'gate.outbound.deny',
@@ -2346,6 +2385,10 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   const channelId = ev.channel as string
   const incomingThreadTs = ev.thread_ts as string | undefined
   deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
+  // SLACKOUTDM1007: a delivered human DM tells us its user for free.
+  if (ev.channel_type === 'im' && !ev.bot_id && typeof ev.user === 'string') {
+    dmOwners.learn(channelId, ev.user)
+  }
 
   journalWrite({
     kind: 'gate.inbound.deliver',

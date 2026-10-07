@@ -982,6 +982,59 @@ export function permissionPairingKey(threadTs: string | undefined, requestId: st
   return `${threadTs ?? ''}\0${requestId}`
 }
 
+/** A Slack DM (IM) channel id: `D` + uppercase alphanumerics. */
+export function isDmChannelId(chatId: string): boolean {
+  return /^D[A-Z0-9]{2,}$/.test(chatId)
+}
+
+/** The subset of `conversations.info` the DM-owner lookup reads. */
+export type ConversationsInfo = (args: { channel: string }) => Promise<{
+  ok?: boolean
+  channel?: { is_im?: boolean; user?: string }
+}>
+
+/**
+ * SLACKOUTDM1007: learns which user a DM channel belongs to, so the outbound
+ * gate can let the bot write to an allowFrom user's DM after a restart.
+ *
+ * - Only `D...` ids are looked up, so a refused channel id never costs an API
+ *   call, and only a channel Slack reports as `is_im` with a `user` counts.
+ * - A DM's user never changes, so a learned pair is kept for the process
+ *   lifetime; the gate still checks allowFrom on every send.
+ * - Fail closed: any API error (for example `missing_scope` on an app without
+ *   `im:read`) learns nothing, and the gate refuses exactly as before. The
+ *   error is reported through `onError`, never thrown.
+ * - Needs the `im:read` bot scope; `im:write` is not used.
+ */
+export function createDmOwnerResolver(
+  conversationsInfo: ConversationsInfo,
+  onError: (chatId: string, err: unknown) => void = () => {},
+): {
+  owners: ReadonlyMap<string, string>
+  learn: (chatId: string, userId: string) => void
+  resolve: (chatId: string) => Promise<void>
+} {
+  const owners = new Map<string, string>()
+  return {
+    owners,
+    learn(chatId: string, userId: string): void {
+      if (isDmChannelId(chatId) && userId) owners.set(chatId, userId)
+    },
+    async resolve(chatId: string): Promise<void> {
+      if (!isDmChannelId(chatId) || owners.has(chatId)) return
+      try {
+        const res = await conversationsInfo({ channel: chatId })
+        const ch = res?.channel
+        if (res?.ok !== false && ch?.is_im === true && typeof ch.user === 'string' && ch.user) {
+          owners.set(chatId, ch.user)
+        }
+      } catch (err) {
+        onError(chatId, err)
+      }
+    },
+  }
+}
+
 /**
  * Throws if `(chatId, threadTs)` names a (channel, thread) pair that
  * has not previously delivered inbound AND `chatId` is not an
@@ -1004,9 +1057,23 @@ export function assertOutboundAllowed(
   threadTs: string | undefined,
   access: Access,
   deliveredThreads: ReadonlySet<string>,
+  dmOwners?: ReadonlyMap<string, string>,
 ): void {
   if (access.channels[chatId]) return
   if (deliveredThreads.has(deliveredThreadKey(chatId, threadTs))) return
+  // SLACKOUTDM1007: the DM of a user in `access.allowFrom` is an outbound
+  // target in its own right, the same trust surface as the inbound DM gate
+  // (handleDmEvent delivers exactly these users). Without this, a restart
+  // emptied `deliveredThreads` and every proactive or scheduled message to
+  // the owner's DM failed until the owner wrote first. `dmOwners` only maps a
+  // DM channel to its (immutable) user; the authority is the allowFrom check
+  // HERE, read fresh on every send, so a user taken out of allowFrom loses
+  // their DM at once. A DM is the bot and that user only, so every thread in
+  // it is eligible, as in an opted-in channel.
+  // Only a DM id takes this path, whatever the map says: a channel is opted in
+  // through access.channels and nowhere else.
+  const dmOwner = isDmChannelId(chatId) ? dmOwners?.get(chatId) : undefined
+  if (dmOwner !== undefined && access.allowFrom.includes(dmOwner)) return
   throw new Error(
     `Outbound gate: (channel ${chatId}, thread ${threadTs ?? '<top-level>'}) is not in the allowlist or delivered-threads set.`,
   )
