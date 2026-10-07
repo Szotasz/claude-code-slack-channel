@@ -1269,7 +1269,35 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     return { action: 'drop' }
   }
 
+  // A thread reply under ANOTHER agent's post belongs to that agent's
+  // conversation (SLACKTHREAD1007): "@Iris ... Mehet?" -> the owner's "Mehet"
+  // in Iris's thread must not wake Zara, who reads everything. Same switch as
+  // above; a tag of this bot in the reply still delivers.
+  if (!policy.requireMention && skipOthers && inPeerThread(ev, botUserId, policy.mentionPeers)) {
+    return { action: 'drop' }
+  }
+
   return { action: 'deliver', access }
+}
+
+/**
+ * True when the message is a thread reply whose parent was posted by a PEER
+ * (another agent's bot user on mentionPeers), and this bot is not tagged in
+ * it. Our own thread (parent = us) and a thread started by a human are never
+ * "peer threads". Without our own id we cannot tell, so fail open.
+ */
+export function inPeerThread(
+  event: Record<string, unknown>,
+  botUserId: string,
+  peers?: readonly string[],
+): boolean {
+  if (!botUserId) return false
+  const threadTs = event.thread_ts as string | undefined
+  const parent = event.parent_user_id as string | undefined
+  if (!threadTs || threadTs === event.ts || !parent) return false
+  if (parent === botUserId) return false
+  if (!peers?.includes(parent)) return false
+  return !isMentioned(event, botUserId)
 }
 
 export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
