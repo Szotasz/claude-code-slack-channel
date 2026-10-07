@@ -37,6 +37,7 @@ import {
   gate,
   generateCode,
   generateCorrelationId,
+  inPeerThread,
   isDuplicateEvent,
   isSlackFileUrl,
   loadOwnThreads,
@@ -10394,5 +10395,90 @@ describe('skipWhenOthersMentioned', () => {
       makeOpts({ access: ch(PEERS), botUserId: '' }),
     )
     expect(r.action).toBe('deliver')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Peer threads: a read-everything bot leaves another agent's thread alone
+// (SLACKTHREAD1007, measured #marketing 2026-10-07: Iris asked "Mehet?",
+// the owner answered "Mehet" in her thread, and Zara answered too).
+// ---------------------------------------------------------------------------
+
+describe('peer threads', () => {
+  const PEERS = { mentionPeers: ['U_IRIS', 'U_BOT'] }
+  const ch = (policy: Record<string, unknown>) =>
+    makeAccess({ channels: { C_MKT: { requireMention: false, allowFrom: [], ...policy } } })
+  const reply = (text: string, parent: string) => ({
+    user: 'U_OWNER',
+    channel: 'C_MKT',
+    channel_type: 'channel',
+    text,
+    ts: '1711000000.000200',
+    thread_ts: '1711000000.000100',
+    parent_user_id: parent,
+  })
+
+  test('the measured case: an untagged reply in IRIS thread does not reach the read-everything bot', async () => {
+    const r = await gate(reply('Mehet', 'U_IRIS'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('drop')
+  })
+
+  test('the same reply that TAGS this bot still arrives', async () => {
+    const r = await gate(
+      reply('<@U_BOT> te is nezd meg', 'U_IRIS'),
+      makeOpts({ access: ch(PEERS) }),
+    )
+    expect(r.action).toBe('deliver')
+  })
+
+  test('a reply in OUR OWN thread arrives without a tag', async () => {
+    const r = await gate(reply('Mehet', 'U_BOT'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('a reply in a thread a HUMAN started arrives (not a peer thread)', async () => {
+    const r = await gate(reply('valasz', 'U_OWNER'), makeOpts({ access: ch(PEERS) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('a top-level message (no thread) is unaffected', async () => {
+    const r = await gate(
+      {
+        user: 'U_OWNER',
+        channel: 'C_MKT',
+        channel_type: 'channel',
+        text: 'mi a helyzet?',
+        ts: '1711000000.000300',
+      },
+      makeOpts({ access: ch(PEERS) }),
+    )
+    expect(r.action).toBe('deliver')
+  })
+
+  test('an unconfigured channel (no mentionPeers) keeps delivering peer-thread replies, as before', async () => {
+    const r = await gate(reply('Mehet', 'U_IRIS'), makeOpts({ access: ch({}) }))
+    expect(r.action).toBe('deliver')
+  })
+
+  test('skipWhenOthersMentioned: false turns the peer-thread rule off too', async () => {
+    const r = await gate(
+      reply('Mehet', 'U_IRIS'),
+      makeOpts({ access: ch({ ...PEERS, skipWhenOthersMentioned: false }) }),
+    )
+    expect(r.action).toBe('deliver')
+  })
+
+  test('requireMention: true channels keep their own rule (untagged peer-thread reply dropped there anyway)', async () => {
+    const access = makeAccess({
+      channels: { C_MKT: { requireMention: true, allowFrom: [], ...PEERS } },
+    })
+    expect((await gate(reply('Mehet', 'U_IRIS'), makeOpts({ access }))).action).toBe('drop')
+  })
+
+  test('inPeerThread fails open without our own id, and ignores the thread parent message itself', () => {
+    expect(inPeerThread(reply('x', 'U_IRIS'), '', ['U_IRIS'])).toBe(false)
+    expect(
+      inPeerThread({ ...reply('x', 'U_IRIS'), ts: '1711000000.000100' }, 'U_BOT', ['U_IRIS']),
+    ).toBe(false)
   })
 })
