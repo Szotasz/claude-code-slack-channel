@@ -32,6 +32,7 @@ import {
   buildAndPostAuditReceipt,
   chunkText,
   createDmOwnerResolver,
+  createGateLog,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -40,6 +41,7 @@ import {
   escMrkdwn,
   formatVerifyResult,
   type GateResult,
+  isDmChannelId,
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
@@ -60,6 +62,7 @@ import {
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
+  slackErrorFields,
   validateSendableRoots,
 } from './lib.ts'
 import {
@@ -525,13 +528,22 @@ const deliveredThreads = new Set<string>()
 // for free from inbound DMs, otherwise looked up once per DM via
 // conversations.info (needs im:read; on error nothing is learned and the gate
 // refuses as before).
+// SLACKLOOKUPLOG1007: the lookup failures and the DM refusals also go to a
+// bounded JSONL file in the state dir, readable on the host without a Slack
+// call (the MCP log keeps only the startup stderr).
+const gateLog = createGateLog(join(STATE_DIR, 'outbound-gate.log'), {
+  onError: (err) =>
+    console.error(
+      '[slack] outbound-gate.log write failed',
+      err instanceof Error ? err.message : err,
+    ),
+})
 const dmOwners = createDmOwnerResolver(
   (args) => web.conversations.info(args),
   (chatId, err) => {
-    console.error('[slack] DM owner lookup failed', {
-      channel: chatId,
-      error: err instanceof Error ? err.message : String(err),
-    })
+    const fields = slackErrorFields(err)
+    console.error('[slack] DM owner lookup failed', { channel: chatId, ...fields })
+    gateLog.append({ event: 'dm_owner_lookup_failed', channel: chatId, ...fields })
   },
 )
 
@@ -576,12 +588,26 @@ async function assertOutboundAllowed(chatId: string, threadTs: string | undefine
     libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)
     return
   } catch (err) {
-    // Not allowed on what we know. If it is a DM we have not seen yet, learn
-    // its user once and decide again; anything else keeps the refusal.
-    await dmOwners.resolve(chatId)
-    if (!dmOwners.owners.has(chatId)) throw err
+    // Not allowed on what we know. A channel keeps the refusal as it is. A DM
+    // we have not seen yet: learn its user once and decide again.
+    if (!isDmChannelId(chatId)) throw err
   }
-  libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)
+  const lookup = await dmOwners.resolve(chatId)
+  try {
+    libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)
+  } catch (err) {
+    // SLACKLOOKUPLOG1007: a refused DM leaves one line with why: the lookup
+    // outcome, and whether the DM's user is known at all (known but refused =
+    // not in allowFrom). Ids only, no user id, no text.
+    gateLog.append({
+      event: 'outbound_deny',
+      channel: chatId,
+      top_level: threadTs === undefined,
+      lookup,
+      owner_known: dmOwners.owners.has(chatId),
+    })
+    throw err
+  }
 }
 
 // The pre-SLACKOUTDM1007 gate, with no allowFrom-DM path. Kept on purpose for

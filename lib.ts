@@ -10,6 +10,7 @@
 
 import { randomBytes } from 'node:crypto'
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
@@ -1012,7 +1013,7 @@ export function createDmOwnerResolver(
 ): {
   owners: ReadonlyMap<string, string>
   learn: (chatId: string, userId: string) => void
-  resolve: (chatId: string) => Promise<void>
+  resolve: (chatId: string) => Promise<DmLookupOutcome>
 } {
   const owners = new Map<string, string>()
   return {
@@ -1020,16 +1021,86 @@ export function createDmOwnerResolver(
     learn(chatId: string, userId: string): void {
       if (isDmChannelId(chatId) && userId) owners.set(chatId, userId)
     },
-    async resolve(chatId: string): Promise<void> {
-      if (!isDmChannelId(chatId) || owners.has(chatId)) return
+    async resolve(chatId: string): Promise<DmLookupOutcome> {
+      if (!isDmChannelId(chatId)) return 'not_dm'
+      if (owners.has(chatId)) return 'cached'
       try {
         const res = await conversationsInfo({ channel: chatId })
         const ch = res?.channel
         if (res?.ok !== false && ch?.is_im === true && typeof ch.user === 'string' && ch.user) {
           owners.set(chatId, ch.user)
+          return 'learned'
         }
+        return 'not_im'
       } catch (err) {
         onError(chatId, err)
+        return 'error'
+      }
+    },
+  }
+}
+
+/** What a DM-owner lookup came to (SLACKLOOKUPLOG1007): for the gate log. */
+export type DmLookupOutcome = 'not_dm' | 'cached' | 'learned' | 'not_im' | 'error'
+
+const TOKEN_RE = /xox[a-z]-[A-Za-z0-9-]+|xapp-[A-Za-z0-9-]+/g
+
+/**
+ * SLACKLOOKUPLOG1007: the loggable part of a Slack WebAPI error. The platform
+ * code (`missing_scope`, `channel_not_found`, ...) and, for a scope error, the
+ * `needed` scope; the message is cut to 200 characters and anything shaped
+ * like a Slack token is masked. Nothing else of the error is kept.
+ */
+export function slackErrorFields(err: unknown): { code: string; needed?: string; message: string } {
+  const e = err as {
+    code?: unknown
+    message?: unknown
+    data?: { error?: unknown; needed?: unknown }
+  } | null
+  const code =
+    (typeof e?.data?.error === 'string' && e.data.error) ||
+    (typeof e?.code === 'string' && e.code) ||
+    'unknown'
+  const needed = typeof e?.data?.needed === 'string' ? e.data.needed : undefined
+  const raw = typeof e?.message === 'string' ? e.message : String(err)
+  const message = raw.replace(TOKEN_RE, '[token]').slice(0, 200)
+  return needed ? { code, needed, message } : { code, message }
+}
+
+/**
+ * SLACKLOOKUPLOG1007: a bounded JSONL log in the state dir, so an outbound
+ * refusal and its cause (e.g. `missing_scope` without im:read) can be read on
+ * the host without a Slack API call. Claude Code's MCP log keeps only the
+ * startup stderr, so console.error alone is invisible after boot.
+ *
+ * - One JSON object per line, with `ts` (ISO) added.
+ * - At most `maxLines` lines: past that the file is rewritten (tmp + rename)
+ *   to its last `maxLines`, so a scope that stays missing (every send retries
+ *   the lookup) cannot fill the disk.
+ * - Best effort: a failed write goes to `onError` and is never thrown; the
+ *   log must not change what the gate decides.
+ * - Callers pass ids and outcomes only: no message text, no token, no user id.
+ */
+export function createGateLog(
+  filePath: string,
+  opts: { maxLines?: number; now?: () => number; onError?: (err: unknown) => void } = {},
+): { append: (entry: Record<string, unknown>) => void } {
+  const maxLines = opts.maxLines ?? 500
+  const now = opts.now ?? Date.now
+  const onError = opts.onError ?? (() => {})
+  return {
+    append(entry: Record<string, unknown>): void {
+      try {
+        const line = `${JSON.stringify({ ts: new Date(now()).toISOString(), ...entry })}\n`
+        appendFileSync(filePath, line, { mode: 0o600 })
+        const lines = readFileSync(filePath, 'utf-8').split('\n').filter(Boolean)
+        if (lines.length > maxLines) {
+          const tmp = `${filePath}.tmp.${process.pid}`
+          writeFileSync(tmp, `${lines.slice(-maxLines).join('\n')}\n`, { mode: 0o600 })
+          renameSync(tmp, filePath)
+        }
+      } catch (err) {
+        onError(err)
       }
     },
   }

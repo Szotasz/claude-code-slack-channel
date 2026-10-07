@@ -1174,6 +1174,129 @@ describe('SLACKOUTDM1007 createDmOwnerResolver', () => {
   })
 })
 
+describe('SLACKLOOKUPLOG1007 lookup outcomes', () => {
+  test('each outcome is reported, and a failed lookup is not cached', async () => {
+    const { createDmOwnerResolver } = await import('./lib.ts')
+    let mode: 'im' | 'not_im' | 'throw' = 'throw'
+    let calls = 0
+    const r = createDmOwnerResolver(async () => {
+      calls++
+      if (mode === 'throw') throw new Error('An API error occurred: missing_scope')
+      return { ok: true, channel: { is_im: mode === 'im', user: 'U_OWNER' } }
+    })
+    expect(await r.resolve('C0CHANNEL')).toBe('not_dm')
+    expect(await r.resolve('D0OWNER1')).toBe('error')
+    expect(await r.resolve('D0OWNER1')).toBe('error') // retried, not cached
+    mode = 'not_im'
+    expect(await r.resolve('D0OWNER1')).toBe('not_im')
+    mode = 'im'
+    expect(await r.resolve('D0OWNER1')).toBe('learned')
+    expect(await r.resolve('D0OWNER1')).toBe('cached')
+    expect(calls).toBe(4)
+  })
+})
+
+describe('SLACKLOOKUPLOG1007 slackErrorFields', () => {
+  test('a Slack scope error: the platform code and the needed scope', async () => {
+    const { slackErrorFields } = await import('./lib.ts')
+    const err = Object.assign(new Error('An API error occurred: missing_scope'), {
+      code: 'slack_webapi_platform_error',
+      data: {
+        ok: false,
+        error: 'missing_scope',
+        needed: 'im:read',
+        provided: 'chat:write,users:read',
+      },
+    })
+    expect(slackErrorFields(err)).toEqual({
+      code: 'missing_scope',
+      needed: 'im:read',
+      message: 'An API error occurred: missing_scope',
+    })
+  })
+  test('a plain error: its code or unknown; the message is cut and a token is masked', async () => {
+    const { slackErrorFields } = await import('./lib.ts')
+    const f = slackErrorFields(
+      Object.assign(new Error(`boom xoxb-123-456-abcDEF ${'x'.repeat(300)}`), {
+        code: 'ECONNRESET',
+      }),
+    )
+    expect(f.code).toBe('ECONNRESET')
+    expect(f.message).not.toContain('xoxb-')
+    expect(f.message).toContain('[token]')
+    expect(f.message.length).toBe(200)
+    expect(f).not.toHaveProperty('needed')
+    expect(slackErrorFields('weird').code).toBe('unknown')
+  })
+})
+
+describe('SLACKLOOKUPLOG1007 createGateLog', () => {
+  test('one JSON line per entry, with ts, mode 0600', async () => {
+    const { createGateLog } = await import('./lib.ts')
+    const dir = mkdtempSync(join(tmpdir(), 'gatelog-'))
+    const f = join(dir, 'outbound-gate.log')
+    const log = createGateLog(f, { now: () => Date.parse('2026-10-07T17:00:00Z') })
+    log.append({ event: 'outbound_deny', channel: 'D0OWNER1', lookup: 'error', owner_known: false })
+    const lines = readFileSync(f, 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(1)
+    expect(JSON.parse(lines[0])).toEqual({
+      ts: '2026-10-07T17:00:00.000Z',
+      event: 'outbound_deny',
+      channel: 'D0OWNER1',
+      lookup: 'error',
+      owner_known: false,
+    })
+    expect(statSync(f).mode & 0o777).toBe(0o600)
+    rmSync(dir, { recursive: true, force: true })
+  })
+  test('bounded: past maxLines only the last maxLines stay', async () => {
+    const { createGateLog } = await import('./lib.ts')
+    const dir = mkdtempSync(join(tmpdir(), 'gatelog-'))
+    const f = join(dir, 'outbound-gate.log')
+    const log = createGateLog(f, { maxLines: 5 })
+    for (let i = 0; i < 12; i++) log.append({ event: 'dm_owner_lookup_failed', n: i })
+    const ns = readFileSync(f, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l).n)
+    expect(ns).toEqual([7, 8, 9, 10, 11])
+    rmSync(dir, { recursive: true, force: true })
+  })
+  test('a failed write is reported, never thrown', async () => {
+    const { createGateLog } = await import('./lib.ts')
+    const errors: unknown[] = []
+    const log = createGateLog('/nonexistent-dir-gatelog/x/outbound-gate.log', {
+      onError: (e) => errors.push(e),
+    })
+    expect(() => log.append({ event: 'outbound_deny' })).not.toThrow()
+    expect(errors).toHaveLength(1)
+  })
+})
+
+describe('SLACKLOOKUPLOG1007 wiring in server.ts', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  test('the log lives in the state dir', () => {
+    expect(src).toContain("const gateLog = createGateLog(join(STATE_DIR, 'outbound-gate.log'), {")
+  })
+  test('a failed lookup is logged with the Slack error fields', () => {
+    expect(src).toContain('const fields = slackErrorFields(err)')
+    expect(src).toContain(
+      "gateLog.append({ event: 'dm_owner_lookup_failed', channel: chatId, ...fields })",
+    )
+  })
+  test('a refused DM is logged with the lookup outcome, ids only', () => {
+    // the refusal is WRITTEN (a gateLog.append call), not just built
+    expect(src).toMatch(/gateLog\.append\(\{\s*event: 'outbound_deny',/)
+    const i = src.indexOf("event: 'outbound_deny',")
+    expect(i).toBeGreaterThan(0)
+    const entry = src.slice(i, src.indexOf('})', i))
+    expect(entry).toContain('lookup,')
+    expect(entry).toContain('owner_known: dmOwners.owners.has(chatId),')
+    // no user id and no text in the line
+    expect(entry).not.toMatch(/owners\.get|text|user:/)
+  })
+})
+
 describe('SLACKOUTDM1007 wiring in server.ts', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   test('the send gate passes the DM map on BOTH checks and learns an unknown DM before refusing', () => {
@@ -1182,8 +1305,9 @@ describe('SLACKOUTDM1007 wiring in server.ts', () => {
         'libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)',
       ).length - 1,
     ).toBe(2)
-    expect(src).toContain('await dmOwners.resolve(chatId)')
-    expect(src).toContain('if (!dmOwners.owners.has(chatId)) throw err')
+    expect(src).toContain('const lookup = await dmOwners.resolve(chatId)')
+    // a non-DM keeps its refusal without any lookup
+    expect(src).toContain('if (!isDmChannelId(chatId)) throw err')
   })
   test('every message tool awaits the DM-aware gate', () => {
     expect(src.split('await ctx.assertOutboundAllowed(').length - 1).toBe(5)
