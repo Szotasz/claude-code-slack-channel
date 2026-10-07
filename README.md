@@ -38,6 +38,7 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
    - `channels:history` — read public channels
    - `groups:history` — read private channels
    - `im:history` — read DMs
+   - `im:read`: look up which user a DM belongs to, so the bot can write to an allowlisted user's DM after a restart (without it, that DM opens only once the user writes first)
    - `reactions:write` — add reactions
    - `files:read` — download shared files
    - `files:write` — upload files
@@ -159,7 +160,7 @@ Self-echoes from this bot are always filtered regardless of `allowBotIds`. Peer 
 ## Security
 
 - **Sender gating**: Every inbound message hits a gate. Ungated messages are silently dropped before reaching Claude.
-- **Outbound gate**: Replies only work to channels that passed the inbound gate.
+- **Outbound gate**: Replies only work to channels that passed the inbound gate, to opted-in channels, and to the DM of a user in `allowFrom` (also right after a restart, before that user has written; needs `im:read`).
 - **File exfiltration guard**: Cannot send `.env`, `access.json`, or other state files through the reply tool.
 - **Prompt injection defense**: System instructions explicitly tell Claude to refuse pairing/access requests from Slack messages.
 - **Bot filtering**: `bot_id` messages are dropped by default. Channels that host multiple cooperating agents can opt in to specific peers via `allowBotIds`; self-echoes are always filtered via `bot_id` / `bot_profile.app_id` / `user` triple-check.

@@ -1035,6 +1035,175 @@ describe('assertOutboundAllowed', () => {
 })
 
 // ---------------------------------------------------------------------------
+// SLACKOUTDM1007: an allowFrom user's DM after a restart
+// ---------------------------------------------------------------------------
+// A restart empties deliveredThreads, and the owner's DM is not in
+// access.channels: before this fix every proactive or scheduled message to the
+// owner's DM failed with "Outbound gate" until the owner wrote first.
+
+describe('SLACKOUTDM1007 outbound to an allowFrom DM after a restart', () => {
+  const OWNER = 'U_OWNER'
+  const STRANGER = 'U_STRANGER'
+  const OWNER_DM = 'D0OWNER1'
+  const STRANGER_DM = 'D0STRANGER'
+  // Restart: nothing delivered yet, no channel opted in.
+  const restarted = () => new Set<string>()
+  const ownerAccess = () => makeAccess({ allowFrom: [OWNER], channels: {} })
+
+  test('the allowFrom user DM is allowed, top-level and in a thread', () => {
+    const owners = new Map([[OWNER_DM, OWNER]])
+    expect(() =>
+      assertOutboundAllowed(OWNER_DM, undefined, ownerAccess(), restarted(), owners),
+    ).not.toThrow()
+    expect(() =>
+      assertOutboundAllowed(OWNER_DM, '1700000000.000100', ownerAccess(), restarted(), owners),
+    ).not.toThrow()
+  })
+
+  test('a stranger DM stays refused', () => {
+    const owners = new Map([[STRANGER_DM, STRANGER]])
+    expect(() =>
+      assertOutboundAllowed(STRANGER_DM, undefined, ownerAccess(), restarted(), owners),
+    ).toThrow('Outbound gate')
+  })
+
+  test('a DM whose user is not known stays refused', () => {
+    expect(() =>
+      assertOutboundAllowed(OWNER_DM, undefined, ownerAccess(), restarted(), new Map()),
+    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed(OWNER_DM, undefined, ownerAccess(), restarted())).toThrow(
+      'Outbound gate',
+    )
+  })
+
+  test('a channel that is not opted in stays refused, even if a stray map entry names an allowFrom user for it', () => {
+    const owners = new Map([
+      ['C0RANDO', OWNER],
+      ['G0PRIVATE', OWNER],
+    ])
+    expect(() =>
+      assertOutboundAllowed('C0RANDO', undefined, ownerAccess(), restarted(), owners),
+    ).toThrow('Outbound gate')
+    expect(() =>
+      assertOutboundAllowed('G0PRIVATE', undefined, ownerAccess(), restarted(), owners),
+    ).toThrow('Outbound gate')
+  })
+
+  test('a user taken out of allowFrom loses their DM at once', () => {
+    const owners = new Map([[OWNER_DM, OWNER]])
+    const access = ownerAccess()
+    expect(() =>
+      assertOutboundAllowed(OWNER_DM, undefined, access, restarted(), owners),
+    ).not.toThrow()
+    access.allowFrom = []
+    expect(() => assertOutboundAllowed(OWNER_DM, undefined, access, restarted(), owners)).toThrow(
+      'Outbound gate',
+    )
+  })
+
+  test('without the DM map the gate is exactly the old one (permission relay, manifest tools)', () => {
+    expect(() => assertOutboundAllowed(OWNER_DM, undefined, ownerAccess(), restarted())).toThrow(
+      'Outbound gate',
+    )
+  })
+})
+
+describe('SLACKOUTDM1007 createDmOwnerResolver', () => {
+  test('learns the user of a D channel that Slack reports as an IM, once', async () => {
+    const { createDmOwnerResolver } = await import('./lib.ts')
+    const calls: string[] = []
+    const r = createDmOwnerResolver(async ({ channel }) => {
+      calls.push(channel)
+      return { ok: true, channel: { is_im: true, user: 'U_OWNER' } }
+    })
+    await r.resolve('D0OWNER1')
+    await r.resolve('D0OWNER1')
+    expect(r.owners.get('D0OWNER1')).toBe('U_OWNER')
+    expect(calls).toEqual(['D0OWNER1'])
+  })
+
+  test('never calls Slack for a non-DM id, and never maps one', async () => {
+    const { createDmOwnerResolver } = await import('./lib.ts')
+    const calls: string[] = []
+    const r = createDmOwnerResolver(async ({ channel }) => {
+      calls.push(channel)
+      return { ok: true, channel: { is_im: true, user: 'U_OWNER' } }
+    })
+    await r.resolve('C0CHANNEL')
+    await r.resolve('G0PRIVATE')
+    r.learn('C0CHANNEL', 'U_OWNER')
+    expect(calls).toEqual([])
+    expect(r.owners.size).toBe(0)
+  })
+
+  test('a channel Slack does not report as an IM is not mapped', async () => {
+    const { createDmOwnerResolver } = await import('./lib.ts')
+    const r = createDmOwnerResolver(async () => ({
+      ok: true,
+      channel: { is_im: false, user: 'U_OWNER' },
+    }))
+    await r.resolve('D0MPIM')
+    expect(r.owners.has('D0MPIM')).toBe(false)
+  })
+
+  test('fail closed: an API error (missing_scope) learns nothing, is reported, and does not throw', async () => {
+    const { createDmOwnerResolver } = await import('./lib.ts')
+    const errors: string[] = []
+    const r = createDmOwnerResolver(
+      async () => {
+        throw new Error('An API error occurred: missing_scope')
+      },
+      (chatId) => errors.push(chatId),
+    )
+    await r.resolve('D0OWNER1')
+    expect(r.owners.has('D0OWNER1')).toBe(false)
+    expect(errors).toEqual(['D0OWNER1'])
+  })
+
+  test('an inbound DM teaches the pair without an API call', async () => {
+    const { createDmOwnerResolver } = await import('./lib.ts')
+    let called = false
+    const r = createDmOwnerResolver(async () => {
+      called = true
+      return {}
+    })
+    r.learn('D0OWNER1', 'U_OWNER')
+    await r.resolve('D0OWNER1')
+    expect(r.owners.get('D0OWNER1')).toBe('U_OWNER')
+    expect(called).toBe(false)
+  })
+})
+
+describe('SLACKOUTDM1007 wiring in server.ts', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  test('the send gate passes the DM map on BOTH checks and learns an unknown DM before refusing', () => {
+    expect(
+      src.split(
+        'libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads, dmOwners.owners)',
+      ).length - 1,
+    ).toBe(2)
+    expect(src).toContain('await dmOwners.resolve(chatId)')
+    expect(src).toContain('if (!dmOwners.owners.has(chatId)) throw err')
+  })
+  test('every message tool awaits the DM-aware gate', () => {
+    expect(src.split('await ctx.assertOutboundAllowed(').length - 1).toBe(5)
+  })
+  test('the permission relay and the manifest tools keep the gate without the DM path', () => {
+    expect(src).toContain('assertOutboundAllowedNoDm(targetChannel, lastActiveThread)')
+    expect(src.split('ctx.assertOutboundAllowedNoDm(channel, undefined)').length - 1).toBe(2)
+    expect(src).toMatch(
+      /function assertOutboundAllowedNoDm\(chatId: string, threadTs: string \| undefined\): void \{\n  libAssertOutboundAllowed\(chatId, threadTs, getAccess\(\), deliveredThreads\)\n\}/,
+    )
+  })
+  test('an inbound human DM teaches its owner', () => {
+    expect(src).toContain(
+      "if (ev.channel_type === 'im' && !ev.bot_id && typeof ev.user === 'string') {",
+    )
+    expect(src).toContain('dmOwners.learn(channelId, ev.user)')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // assertPublishAllowed — publish-manifest gate (Epic 31-B.5, ccsc-0qk.5)
 //
 // Only user_ids in the top-level access.allowFrom may publish a manifest.
