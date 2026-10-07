@@ -17,6 +17,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **000-docs/key-management.md — operational doc for the audit-signing key** (`ccsc-c2z`). Specifies the load-bearing operational decisions for the Ed25519 signing key that will back journal v2 (`ccsc-22l`): SOPS-encrypted file at `~/.claude/channels/slack/audit.key.sops.yaml` decrypted to `/dev/shm` at boot via age; 90-day rotation cadence with `system.key_rotation` event written under the old key; external public-key pin in an operator-controlled GitHub gist; lost-key recovery via `audit.log.<timestamp>.broken-chain` + `system.chain_break` event; compromise recovery via `ccsc audit-key rotate --reason=compromise-suspected`; `--no-audit-signing` emergency valve flag. Lands BEFORE the signing code in `ccsc-22l` so the operational decisions are decided in writing first. Inherits the Intent Solutions SOPS + age secrets standard.
 - **THREAT-MODEL.md — T11 (operator-coerced admin command, EchoLeak class) + invariant #7** (`ccsc-o6x`). Adds explicit recognition of the EchoLeak / CVE-2025-32711 threat class (zero-click prompt injection coercing a privileged operator into emitting an admin verb), with citations to PromptArmor's Slack-AI exfiltration finding (MITRE ATLAS AML-CS0035), the Anthropic Slack MCP unfurl advisory, and "Your AI, My Shell" (Liu et al. 2025, 84% attack success against CLI agent surfaces). Invariant #7 formalizes the operational floor: admin verbs cannot be promoted from chat content without a server-minted HMAC nonce + cross-channel confirmation. This is the unblock for the *Admin Commands + Audit/Policy/Governance v2 Cluster* rollout (tracking issue #167) — every subsequent design doc in the rollout cites T11. No code change; the invariants are enforced by the beads that follow (`ccsc-3w0`, `ccsc-ofn`, `ccsc-22l`, `ccsc-8pw`, `ccsc-06s`).
 
+## [fork 0.2.1] - 2026-10-07
+
+Fork releases (Szotasz/claude-code-slack-channel) are numbered by `.claude-plugin/plugin.json`, the version the Claude Code marketplace reads, not by `package.json` or the upstream tags. The upstream `[0.2.0] - 2026-04-09` further down is a different, unrelated release.
+
+### Added
+
+- **Outbound gate log** (SLACKLOOKUPLOG1007). A failed DM-owner lookup (with the Slack error code and, for a scope error, the `needed` scope, e.g. `missing_scope` / `im:read`) and every refused DM write (with the lookup outcome) go to `<state dir>/outbound-gate.log` as JSONL, bounded to the last 500 lines. Readable on the host without a Slack API call: Claude Code's MCP log keeps only the startup stderr. Channel ids and outcomes only, no message text, no user id, tokens masked.
+
+## [fork 0.2.0] - 2026-10-07
+
+### Fixed
+
+- **An allowFrom user's DM is an outbound target, also right after a restart** (SLACKOUTDM1007, #5). `deliveredThreads` is in memory only, so after a restart every proactive or scheduled message to the owner's DM failed with "Outbound gate" until the owner wrote first. The DM of a user in `access.allowFrom` now passes the gate; the user of a DM is learned from inbound DMs or once via `conversations.info` (needs the `im:read` scope; fails closed without it). The permission relay and the manifest tools keep the previous gate.
+
+### Added
+
+- **A read-everything bot leaves another agent's thread alone** (SLACKTHREAD1007, #4).
+
+### Notes
+
+- The fork's plugin version had stayed at 0.1.0, so `claude plugin update` never offered a new commit (SLACKPLUGINVER1006). #3 (SLACKMENTION1006) went out under 0.1.0 by a manual cache deploy.
+
 ## [0.9.1] - 2026-05-13
 
 ### Added
