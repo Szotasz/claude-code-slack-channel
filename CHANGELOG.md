@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **000-docs/key-management.md — operational doc for the audit-signing key** (`ccsc-c2z`). Specifies the load-bearing operational decisions for the Ed25519 signing key that will back journal v2 (`ccsc-22l`): SOPS-encrypted file at `~/.claude/channels/slack/audit.key.sops.yaml` decrypted to `/dev/shm` at boot via age; 90-day rotation cadence with `system.key_rotation` event written under the old key; external public-key pin in an operator-controlled GitHub gist; lost-key recovery via `audit.log.<timestamp>.broken-chain` + `system.chain_break` event; compromise recovery via `ccsc audit-key rotate --reason=compromise-suspected`; `--no-audit-signing` emergency valve flag. Lands BEFORE the signing code in `ccsc-22l` so the operational decisions are decided in writing first. Inherits the Intent Solutions SOPS + age secrets standard.
 - **THREAT-MODEL.md — T11 (operator-coerced admin command, EchoLeak class) + invariant #7** (`ccsc-o6x`). Adds explicit recognition of the EchoLeak / CVE-2025-32711 threat class (zero-click prompt injection coercing a privileged operator into emitting an admin verb), with citations to PromptArmor's Slack-AI exfiltration finding (MITRE ATLAS AML-CS0035), the Anthropic Slack MCP unfurl advisory, and "Your AI, My Shell" (Liu et al. 2025, 84% attack success against CLI agent surfaces). Invariant #7 formalizes the operational floor: admin verbs cannot be promoted from chat content without a server-minted HMAC nonce + cross-channel confirmation. This is the unblock for the *Admin Commands + Audit/Policy/Governance v2 Cluster* rollout (tracking issue #167) — every subsequent design doc in the rollout cites T11. No code change; the invariants are enforced by the beads that follow (`ccsc-3w0`, `ccsc-ofn`, `ccsc-22l`, `ccsc-8pw`, `ccsc-06s`).
 
+## [fork 0.2.3] - 2026-10-15
+
+### Fixed
+
+- **Answer-button labels also refuse the Unicode line and paragraph separators** (U+2028, U+2029; SLACKGOMB1015 review). They break a line like a newline, and the label comes back as message text inside the session's <channel> tag; refused when the buttons go out and when a press comes in, like the control and format characters.
+
 ## [fork 0.2.2] - 2026-10-15
 
 ### Added

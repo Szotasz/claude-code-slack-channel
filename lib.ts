@@ -2112,7 +2112,8 @@ const SECTION_TEXT_MAX = 3000
 /**
  * A label is safe when it carries no control or format character (\p{Cc}:
  * newlines, tabs, NUL...; \p{Cf}: bidi overrides and isolates, zero-width
- * characters) and no `<channel` / `</channel` shape. The label comes back as
+ * characters), no Unicode line or paragraph separator (\p{Zl} U+2028,
+ * \p{Zp} U+2029: a line break by another name) and no `<channel` / `</channel` shape. The label comes back as
  * the text of an inbound message, inside the session's <channel> tag: a line
  * break, a hidden bidi run or a tag-shaped label could frame text as if it
  * were something other than the presser's answer. Checked both when the
@@ -2120,7 +2121,7 @@ const SECTION_TEXT_MAX = 3000
  * the value in it is whatever was posted).
  */
 export function isSafeAnswerLabel(label: string): boolean {
-  return !/[\p{Cc}\p{Cf}]/u.test(label) && !/<\s*\/?\s*channel/i.test(label)
+  return !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(label) && !/<\s*\/?\s*channel/i.test(label)
 }
 
 /**
