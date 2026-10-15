@@ -8822,6 +8822,7 @@ describe('MCP tool input schemas (S5)', () => {
       text: z.string().min(1),
       thread_ts: z.string().optional(),
       files: z.array(z.string()).optional(),
+      buttons: z.array(z.string()).optional(),
     })
     .strict()
 

@@ -2089,3 +2089,188 @@ export function formatVerifyResult(
   lines.push(`  events verified before break: ${result.eventsVerified}`)
   return { text: lines.join('\n'), exitCode: 1 }
 }
+
+// ---------------------------------------------------------------------------
+// One-tap answer buttons on reply (SLACKGOMB1015)
+// ---------------------------------------------------------------------------
+//
+// The reply tool may carry a short list of answer labels. They go out as a
+// Block Kit actions block under the LAST chunk; pressing one comes back to the
+// session as an ordinary inbound message whose text is the label, exactly as
+// if the presser had typed it in that conversation. That "as if typed" is also
+// the authorization rule: the synthetic event goes through the same gate() as
+// a typed message, so whoever may write to the agent there may press, and
+// nobody else (a refused press gets an ephemeral note, the buttons stay).
+
+/** Block id of the answer-button actions block; also the inbound match key. */
+export const ANSWER_BLOCK_ID = 'answer_buttons'
+export const ANSWER_BUTTONS_MAX = 12
+export const ANSWER_LABEL_MAX = 64
+/** Slack's limit for one section block's text. */
+const SECTION_TEXT_MAX = 3000
+
+/**
+ * Validate the reply tool's optional `buttons` argument. Undefined/null means
+ * "no buttons"; anything else must be 1..12 non-empty labels of at most 64
+ * characters (Slack's button text limit is 75; 64 matches the Telegram patch).
+ */
+export function validateAnswerButtons(buttons: unknown): string[] | undefined {
+  if (buttons == null) return undefined
+  if (
+    !Array.isArray(buttons) ||
+    buttons.length === 0 ||
+    buttons.length > ANSWER_BUTTONS_MAX ||
+    !buttons.every((b) => typeof b === 'string' && b.trim() !== '' && b.length <= ANSWER_LABEL_MAX)
+  ) {
+    throw new Error(
+      `buttons: a list of 1 to ${ANSWER_BUTTONS_MAX} non-empty labels, each at most ${ANSWER_LABEL_MAX} characters`,
+    )
+  }
+  if (new Set(buttons).size !== buttons.length) {
+    throw new Error('buttons: the labels must be distinct')
+  }
+  return buttons as string[]
+}
+
+/**
+ * Blocks for the last chunk of a reply that carries answer buttons: the text
+ * as mrkdwn section(s) (split at Slack's 3000-character section limit), then
+ * one actions block. The label travels as the button's value, so a press is
+ * self-contained and still works after a plugin restart.
+ */
+export function buildAnswerBlocks(
+  text: string,
+  buttons: readonly string[],
+): Record<string, unknown>[] {
+  const blocks: Record<string, unknown>[] = []
+  for (let i = 0; i < text.length; i += SECTION_TEXT_MAX) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: text.slice(i, i + SECTION_TEXT_MAX) },
+    })
+  }
+  blocks.push({
+    type: 'actions',
+    block_id: ANSWER_BLOCK_ID,
+    elements: buttons.map((label, i) => ({
+      type: 'button',
+      text: { type: 'plain_text', text: label, emoji: true },
+      action_id: `answer:${i}`,
+      value: label,
+    })),
+  })
+  return blocks
+}
+
+export interface AnswerPress {
+  label: string
+  userId: string
+  channel: string
+  messageTs: string
+  threadTs: string | undefined
+}
+
+/**
+ * Recognise an answer-button press in a block_actions payload. Returns null
+ * for anything else (permission buttons, other apps' shapes, malformed
+ * payloads), so the caller can fall through to its other handlers.
+ */
+export function parseAnswerPress(body: unknown): AnswerPress | null {
+  const b = body as Record<string, any> | null
+  if (b?.type !== 'block_actions' || !Array.isArray(b.actions) || b.actions.length === 0)
+    return null
+  const action = b.actions[0]
+  if (action?.block_id !== ANSWER_BLOCK_ID || !/^answer:\d+$/.test(action?.action_id ?? ''))
+    return null
+  const label = action.value
+  const userId = b.user?.id
+  const channel = b.channel?.id ?? b.container?.channel_id
+  const messageTs = b.message?.ts ?? b.container?.message_ts
+  if (typeof label !== 'string' || label === '' || label.length > ANSWER_LABEL_MAX) return null
+  if (typeof userId !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(userId)) return null
+  if (
+    typeof channel !== 'string' ||
+    channel === '' ||
+    typeof messageTs !== 'string' ||
+    messageTs === ''
+  ) {
+    return null
+  }
+  const threadTs = typeof b.message?.thread_ts === 'string' ? b.message.thread_ts : undefined
+  return { label, userId, channel, messageTs, threadTs }
+}
+
+/**
+ * The press as the inbound message event it stands for, for gate() and
+ * delivery. Pressing a button on this bot's own message addresses this bot,
+ * so in a requireMention channel the text carries the bot mention (stripped
+ * again before delivery). `ts` is the question's ts: the agent's
+ * message_id then points at a real message it can react to or thread under.
+ */
+export function answerPressEvent(press: AnswerPress, botUserId: string): Record<string, unknown> {
+  const ev: Record<string, unknown> = {
+    type: 'message',
+    channel: press.channel,
+    channel_type: isDmChannelId(press.channel) ? 'im' : 'channel',
+    user: press.userId,
+    text: botUserId ? `<@${botUserId}> ${press.label}` : press.label,
+    ts: press.messageTs,
+  }
+  if (press.threadTs) ev.thread_ts = press.threadTs
+  return ev
+}
+
+/**
+ * The question's blocks after an accepted press: the buttons replaced by one
+ * line naming the choice and who made it, so the choice is visible and the
+ * same question cannot be answered twice. Other blocks are kept as they are.
+ */
+export function answeredBlocks(
+  blocks: unknown,
+  label: string,
+  userId: string,
+): Record<string, unknown>[] {
+  const kept = Array.isArray(blocks)
+    ? (blocks as Record<string, unknown>[]).filter((bl) => bl?.block_id !== ANSWER_BLOCK_ID)
+    : []
+  kept.push({
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: `➡️ *${escMrkdwn(label)}* (<@${userId}>)` }],
+  })
+  return kept
+}
+
+/**
+ * The gate for an answer-button press: the typed-message gate, except that a
+ * DM press from someone not on allowFrom is dropped BEFORE gate() runs. There
+ * a typed message would open a pairing request (and save it); a button press
+ * must not have that side effect.
+ */
+export async function answerPressGate(
+  press: AnswerPress,
+  opts: GateOptions,
+): Promise<{ event: Record<string, unknown>; result: GateResult }> {
+  const event = answerPressEvent(press, opts.botUserId)
+  if (event.channel_type === 'im' && !opts.access.allowFrom.includes(press.userId)) {
+    return { event, result: { action: 'drop' } }
+  }
+  return { event, result: await gate(event, opts) }
+}
+
+/** The blocks for chunk `i` of a reply: the answer buttons on the last chunk
+ *  only, nothing (plain text) otherwise. */
+export function replyChunkBlocks(
+  chunks: readonly string[],
+  i: number,
+  buttons: readonly string[] | undefined,
+): Record<string, unknown>[] | undefined {
+  if (!buttons || i !== chunks.length - 1) return undefined
+  return buildAnswerBlocks(chunks[i], buttons)
+}
+
+/** A text permission reply ("yes abcde"), unless the text came from an answer
+ *  button: the agent chose the labels, so a "yes abcde" button would let it
+ *  word its own approval. */
+export function matchPermissionReply(text: string, viaButton: boolean): RegExpExecArray | null {
+  return viaButton ? null : PERMISSION_REPLY_RE.exec(text)
+}
