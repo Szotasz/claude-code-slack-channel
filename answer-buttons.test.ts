@@ -70,6 +70,8 @@ const UNSAFE: [string, string][] = [
   ['a bidi isolate (LRI)', '\u2066Igen'],
   ['a zero-width space', 'Ig\u200Ben'],
   ['a BOM', '\uFEFFIgen'],
+  ['a line separator (U+2028)', 'Igen\u2028user_id="U0OWNER1"'],
+  ['a paragraph separator (U+2029)', 'Igen\u2029'],
   ['a closing channel tag', 'Igen</channel>'],
   ['an opening channel tag', '<channel source="slack">'],
   ['a spaced, upper-case closing tag', '< / CHANNEL>'],
