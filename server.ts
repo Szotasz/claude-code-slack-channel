@@ -34,6 +34,7 @@ import {
   assertPublishAllowed,
   buildAndPostAuditReceipt,
   chunkText,
+  claimAnswer,
   createDmOwnerResolver,
   createGateLog,
   decidePermissionRoute,
@@ -844,7 +845,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description:
-              'Optional one-tap answer buttons (1 to 12 distinct labels, each at most 64 characters) under the message. A press arrives as an ordinary inbound message whose text is the label; the buttons then give way to a line naming the choice.',
+              'Optional one-tap answer buttons (1 to 12 distinct single-line labels, each at most 64 characters, no control or format characters) under the message. A press arrives as an ordinary inbound message whose text is the label; the buttons then give way to a line naming the choice.',
           },
         },
         required: ['chat_id', 'text'],
@@ -2291,10 +2292,10 @@ async function handleAnswerPress(
   press: AnswerPress,
   message: { text?: unknown; blocks?: unknown } | undefined,
 ): Promise<void> {
-  const now = Date.now()
-  for (const [k, exp] of answeredQuestions) if (exp <= now) answeredQuestions.delete(k)
   const key = `${press.channel}:${press.messageTs}`
-  if (answeredQuestions.has(key)) return
+  // Claimed before the gate, not after it: two presses must not both pass
+  // while the first one awaits gate(). A refused press gives it back below.
+  if (!claimAnswer(answeredQuestions, key, Date.now(), ANSWERED_TTL_MS)) return
 
   const { event: ev, result } = await answerPressGate(press, {
     access: getAccess(),
@@ -2306,6 +2307,7 @@ async function handleAnswerPress(
     ownPostedTimestamps,
   })
   if (result.action !== 'deliver') {
+    answeredQuestions.delete(key)
     journalWrite({
       kind: 'gate.inbound.drop',
       outcome: 'drop',
@@ -2324,7 +2326,6 @@ async function handleAnswerPress(
     return
   }
 
-  answeredQuestions.set(key, now + ANSWERED_TTL_MS)
   try {
     await web.chat.update({
       channel: press.channel,

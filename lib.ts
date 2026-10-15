@@ -2110,6 +2110,20 @@ export const ANSWER_LABEL_MAX = 64
 const SECTION_TEXT_MAX = 3000
 
 /**
+ * A label is safe when it carries no control or format character (\p{Cc}:
+ * newlines, tabs, NUL...; \p{Cf}: bidi overrides and isolates, zero-width
+ * characters) and no `<channel` / `</channel` shape. The label comes back as
+ * the text of an inbound message, inside the session's <channel> tag: a line
+ * break, a hidden bidi run or a tag-shaped label could frame text as if it
+ * were something other than the presser's answer. Checked both when the
+ * buttons go out and when a press comes in (a press payload is Slack's, but
+ * the value in it is whatever was posted).
+ */
+export function isSafeAnswerLabel(label: string): boolean {
+  return !/[\p{Cc}\p{Cf}]/u.test(label) && !/<\s*\/?\s*channel/i.test(label)
+}
+
+/**
  * Validate the reply tool's optional `buttons` argument. Undefined/null means
  * "no buttons"; anything else must be 1..12 non-empty labels of at most 64
  * characters (Slack's button text limit is 75; 64 matches the Telegram patch).
@@ -2120,10 +2134,16 @@ export function validateAnswerButtons(buttons: unknown): string[] | undefined {
     !Array.isArray(buttons) ||
     buttons.length === 0 ||
     buttons.length > ANSWER_BUTTONS_MAX ||
-    !buttons.every((b) => typeof b === 'string' && b.trim() !== '' && b.length <= ANSWER_LABEL_MAX)
+    !buttons.every(
+      (b) =>
+        typeof b === 'string' &&
+        b.trim() !== '' &&
+        b.length <= ANSWER_LABEL_MAX &&
+        isSafeAnswerLabel(b),
+    )
   ) {
     throw new Error(
-      `buttons: a list of 1 to ${ANSWER_BUTTONS_MAX} non-empty labels, each at most ${ANSWER_LABEL_MAX} characters`,
+      `buttons: a list of 1 to ${ANSWER_BUTTONS_MAX} non-empty labels, each at most ${ANSWER_LABEL_MAX} characters, with no control or format character and no <channel tag`,
     )
   }
   if (new Set(buttons).size !== buttons.length) {
@@ -2186,7 +2206,14 @@ export function parseAnswerPress(body: unknown): AnswerPress | null {
   const userId = b.user?.id
   const channel = b.channel?.id ?? b.container?.channel_id
   const messageTs = b.message?.ts ?? b.container?.message_ts
-  if (typeof label !== 'string' || label === '' || label.length > ANSWER_LABEL_MAX) return null
+  if (
+    typeof label !== 'string' ||
+    label === '' ||
+    label.length > ANSWER_LABEL_MAX ||
+    !isSafeAnswerLabel(label)
+  ) {
+    return null
+  }
   if (typeof userId !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(userId)) return null
   if (
     typeof channel !== 'string' ||
@@ -2273,4 +2300,23 @@ export function replyChunkBlocks(
  *  word its own approval. */
 export function matchPermissionReply(text: string, viaButton: boolean): RegExpExecArray | null {
   return viaButton ? null : PERMISSION_REPLY_RE.exec(text)
+}
+
+/**
+ * Claim a question for one press: false when it is already claimed (a second
+ * press, or a press racing the first one through the gate), else claimed until
+ * `now + ttlMs`. Taken BEFORE the gate runs, so two presses cannot both pass
+ * the check while the first awaits gate(); a press the gate refuses gives the
+ * claim back (`claims.delete(key)`), so the right person can still answer.
+ */
+export function claimAnswer(
+  claims: Map<string, number>,
+  key: string,
+  now: number,
+  ttlMs: number,
+): boolean {
+  for (const [k, exp] of claims) if (exp <= now) claims.delete(k)
+  if (claims.has(key)) return false
+  claims.set(key, now + ttlMs)
+  return true
 }
