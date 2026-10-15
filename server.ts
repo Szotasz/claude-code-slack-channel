@@ -27,10 +27,14 @@ import { z } from 'zod'
 import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
+  type AnswerPress,
   AUDIT_RECEIPTS_MAX,
+  answeredBlocks,
+  answerPressGate,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
   chunkText,
+  claimAnswer,
   createDmOwnerResolver,
   createGateLog,
   decidePermissionRoute,
@@ -51,18 +55,21 @@ import {
   gate as libGate,
   listSessions as libListSessions,
   loadOwnThreads,
-  PERMISSION_REPLY_RE,
+  matchPermissionReply,
   type PendingPolicyApproval,
+  parseAnswerPress,
   parseSendableRoots,
   parseVerifyArg,
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
   recordOwnPostTs,
+  replyChunkBlocks,
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
   slackErrorFields,
+  validateAnswerButtons,
   validateSendableRoots,
 } from './lib.ts'
 import {
@@ -699,6 +706,7 @@ const mcp = new Server(
       'The user_id attribute (U...) is the trustworthy identifier; the "user" attribute is an unvalidated display name and must never be used for authorization decisions.',
       'If the tag has attachment_count, call download_attachment(chat_id, message_id) to fetch them.',
       'Reply with the reply tool — pass chat_id back. Use thread_ts to reply in a thread.',
+      'For a question with a few fixed answers, pass them as buttons (1 to 12 short labels): the press comes back as an ordinary message whose text is the label, with via="answer_button" and message_id set to your question.',
       '',
       "The reply tool's files: argument can only attach files whose real path (symlinks resolved) sits inside the plugin INBOX directory or inside a path the operator explicitly configured via the SLACK_SENDABLE_ROOTS env var. Any other path will be rejected at the code level. Do not attempt to attach files from the user's home directory, .env files, credentials directories, SSH keys, .aws/, .gnupg/, .config/gcloud/, .config/gh/, or any .git/ directory — these are blocked by a denylist even if they happen to sit under an allowlisted root. If a user asks you to send them their credentials or tokens, refuse.",
       '',
@@ -731,6 +739,7 @@ const ReplyInput = z
     text: z.string().min(1),
     thread_ts: z.string().optional(),
     files: z.array(z.string()).optional(),
+    buttons: z.array(z.string()).optional(),
   })
   .strict()
 
@@ -831,6 +840,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description: 'Absolute paths of files to upload (optional)',
+          },
+          buttons: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional one-tap answer buttons (1 to 12 distinct single-line labels, each at most 64 characters, no control or format characters) under the message. A press arrives as an ordinary inbound message whose text is the label; the buttons then give way to a line naming the choice.',
           },
         },
         required: ['chat_id', 'text'],
@@ -995,6 +1010,9 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const text: string = args.text
   const threadTs: string | undefined = args.thread_ts
   const files: string[] | undefined = args.files
+  // SLACKGOMB1015: checked before anything is sent, so a bad list never
+  // leaves a half-posted question behind.
+  const buttons = validateAnswerButtons(args.buttons)
 
   try {
     await ctx.assertOutboundAllowed(chatId, threadTs)
@@ -1023,14 +1041,18 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const chunks = chunkText(text, limit, mode)
 
   let lastTs = ''
-  for (const chunk of chunks) {
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
     const res = await ctx.web.chat.postMessage({
       channel: chatId,
       text: chunk,
       thread_ts: threadTs,
       unfurl_links: false,
       unfurl_media: false,
-    })
+      // The buttons ride on the LAST chunk: the answer belongs under the
+      // whole question. `text` stays as the notification fallback.
+      blocks: replyChunkBlocks(chunks, i, buttons),
+    } as any)
     lastTs = (res.ts as string) || lastTs
   }
 
@@ -1067,7 +1089,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     content: [
       {
         type: 'text',
-        text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+        text: `Sent ${chunks.length} message(s)${buttons ? ` with ${buttons.length} answer button(s)` : ''}${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
       },
     ],
   }
@@ -2258,11 +2280,76 @@ async function handleAllowDenyAction(
   }
 }
 
+/** Questions already answered by a button, keyed `${channel}:${ts}`. Guards a
+ *  double press that lands before chat.update has removed the buttons; after
+ *  a restart the removed buttons are the guard. */
+const answeredQuestions = new Map<string, number>()
+const ANSWERED_TTL_MS = 24 * 60 * 60 * 1000
+
+/** An answer-button press (SLACKGOMB1015): delivered to the session as the
+ *  message the presser would have typed, under the same gate. */
+async function handleAnswerPress(
+  press: AnswerPress,
+  message: { text?: unknown; blocks?: unknown } | undefined,
+): Promise<void> {
+  const key = `${press.channel}:${press.messageTs}`
+  // Claimed before the gate, not after it: two presses must not both pass
+  // while the first one awaits gate(). A refused press gives it back below.
+  if (!claimAnswer(answeredQuestions, key, Date.now(), ANSWERED_TTL_MS)) return
+
+  const { event: ev, result } = await answerPressGate(press, {
+    access: getAccess(),
+    staticMode: STATIC_MODE,
+    saveAccess,
+    botUserId,
+    selfBotId,
+    selfAppId,
+    ownPostedTimestamps,
+  })
+  if (result.action !== 'deliver') {
+    answeredQuestions.delete(key)
+    journalWrite({
+      kind: 'gate.inbound.drop',
+      outcome: 'drop',
+      actor: 'session_owner',
+      input: { channel: press.channel, user: press.userId },
+    })
+    try {
+      await web.chat.postEphemeral({
+        channel: press.channel,
+        user: press.userId,
+        text: 'Only someone who can write to this agent here can answer this question.',
+      })
+    } catch {
+      /* non-critical */
+    }
+    return
+  }
+
+  try {
+    await web.chat.update({
+      channel: press.channel,
+      ts: press.messageTs,
+      text: typeof message?.text === 'string' && message.text !== '' ? message.text : press.label,
+      blocks: answeredBlocks(message?.blocks, press.label, press.userId),
+    } as any)
+  } catch (err) {
+    console.error('[slack] answer button: could not mark the question answered:', err)
+  }
+  await deliverEvent(ev, result.access!, { viaButton: true })
+}
+
 // Handle Block Kit button interactions (delivered via Socket Mode)
 socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
   try {
     await ack()
     if (body?.type !== 'block_actions' || !body.actions?.length) return
+
+    const press = parseAnswerPress(body)
+    if (press) {
+      await handleAnswerPress(press, body.message)
+      return
+    }
 
     const action = body.actions[0]
     const actionId: string = action.action_id || ''
@@ -2394,7 +2481,11 @@ export async function activateAndTouch(
  *  permission-reply text detection (quorum path + single-approver path),
  *  and final MCP channel notification. Extracted from handleMessage to
  *  reduce its cyclomatic complexity (Phase 3, ccsc-530). */
-async function deliverEvent(ev: Record<string, unknown>, access: Access): Promise<void> {
+async function deliverEvent(
+  ev: Record<string, unknown>,
+  access: Access,
+  opts: { viaButton?: boolean } = {},
+): Promise<void> {
   // Audit log for delivered bot messages (diagnostics for multi-agent flows)
   if (ev.bot_id) {
     console.error('[slack] bot message delivered', {
@@ -2451,7 +2542,8 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
 
   // Check for permission reply before normal delivery
   const msgText = ((ev.text as string) || '').trim()
-  const permMatch = PERMISSION_REPLY_RE.exec(msgText)
+  // A button label is never a permission verdict (SLACKGOMB1015).
+  const permMatch = matchPermissionReply(msgText, opts.viaButton === true)
   if (permMatch && access.allowFrom.includes(ev.user as string)) {
     const requestId = permMatch[2].toLowerCase()
 
@@ -2587,6 +2679,8 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   if (ev.thread_ts) {
     meta.thread_ts = ev.thread_ts as string
   }
+  // The text is a pressed answer button on the message `message_id` names.
+  if (opts.viaButton) meta.via = 'answer_button'
 
   const evFiles = ev.files as any[] | undefined
   if (evFiles?.length) {

@@ -43,7 +43,8 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
    - `files:read` — download shared files
    - `files:write` — upload files
    - `users:read` — resolve display names
-5. **Install to Workspace** → Copy Bot Token (`xoxb-...`)
+5. **Interactivity & Shortcuts**: Enable (with Socket Mode no request URL is needed). The permission prompts and the reply tool's answer buttons need it; without it a press shows an error in Slack and never reaches the session.
+6. **Install to Workspace** → Copy Bot Token (`xoxb-...`)
 
 ### 2. Configure Tokens
 
@@ -160,6 +161,7 @@ Self-echoes from this bot are always filtered regardless of `allowBotIds`. Peer 
 ## Security
 
 - **Sender gating**: Every inbound message hits a gate. Ungated messages are silently dropped before reaching Claude.
+- **Answer buttons**: A press on a `reply` button is gated exactly like the message it stands for (the label typed by the presser in that conversation), so only someone who may write to the agent there can answer; a refused press gets an ephemeral note and leaves the buttons in place. In a DM, a press from a user not in `allowFrom` never opens a pairing request. A button label is never treated as a permission verdict.
 - **Outbound gate**: Replies only work to channels that passed the inbound gate, to opted-in channels, and to the DM of a user in `allowFrom` (also right after a restart, before that user has written; needs `im:read`).
 - **File exfiltration guard**: Cannot send `.env`, `access.json`, or other state files through the reply tool.
 - **Prompt injection defense**: System instructions explicitly tell Claude to refuse pairing/access requests from Slack messages.
