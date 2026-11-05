@@ -162,6 +162,7 @@ missed primitive is a bypass.
 |------------------|---------|----------|-------------------------------------------------------|-------------------------------------------------|
 | `.env`           | SO      | 0o600    | token theft → workspace-wide compromise               | `chmod 0o600` + atomic writes + never logged   |
 | `access.json`    | SO      | 0o600    | allowlist widening → inbound-gate bypass              | 0o600, atomic writes, CLI writes via MCP skills |
+| `delivered-dms.json` | server | 0o600 | a row binding a stranger's DM channel to an allowFrom user → outbound to a foreign DM (T5) | 0o600, atomic writes (tmp + rename), strict load (no symlink, owner uid, size cap, exact row shape, one channel per user); healed at that user's next real DM; deployment must guard it like `access.json` (T5) |
 | `sessions/*`     | CC (via server) | 0o600 | cross-thread state injection                  | realpath-guarded `sessionPath()` (Epic 32-A)    |
 | `audit.log`      | server  | 0o600    | evidence destruction                                  | hash-chain (SHA-256, Schneier-Kelsey) (Epic 30-A) |
 | `inbox/*`        | server  | 0o600    | exfil staging ground                                  | `sanitizeFilename()` + never re-shared unless via (f) above |
@@ -259,6 +260,30 @@ missed primitive is a bypass.
 - **Residual risk**: same-UID processes (anything the session owner runs)
   can read and write the file. Out of scope — this is a UID-trust boundary
   by design.
+
+**`delivered-dms.json` (SLACKOUTDM1007) is in the same class.** It keeps,
+across restarts, the DM channels an `allowFrom` user has written from, and
+at boot it teaches the DM-owner map that the outbound gate reads. Nothing in
+the file proves that a channel belongs to its user: a well-formed row that
+binds a stranger's `D...` channel to an `allowFrom` user's id is believed,
+and after the next start that stranger's DM is an outbound target.
+
+- The server writes it only from a delivered inbound DM of an `allowFrom`
+  user, atomically (`<file>.tmp.<pid>`, mode `0o600`, `rename`).
+- The load refuses the whole file on a symlink, a non-regular file, another
+  owner uid, more than 64 KiB, bad JSON, a wrong shape or version, a channel
+  listed twice, or one user bound to two channels (a bot has one DM per
+  user). A malformed row is dropped; a user no longer in `allowFrom` is
+  dropped; the gate still checks `allowFrom` on every send.
+- A forged binding is healed at that user's next real DM: the channel they
+  write from replaces any other channel bound to them, in the file and in
+  the running process.
+- **Residual risk**: until then, a same-UID writer that forges a row for an
+  `allowFrom` user's id gets one outbound DM target. A deployment that
+  guards its trust files (`access.json`, `.env`) against the agent session
+  itself must guard `delivered-dms.json` and its temporary name
+  `delivered-dms.json.tmp.*` the same way. The residual is pinned by a test
+  (`RESIDUAL (THREAT-MODEL T5)` in `server.test.ts`).
 
 ### T6. Outbound-gate bypass (CC → arbitrary channel)
 

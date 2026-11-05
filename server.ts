@@ -591,7 +591,15 @@ function restoreDeliveredDms(): void {
 }
 
 function rememberDeliveredDm(channel: string, user: string, access: Access): void {
-  if (!recordDeliveredDm(deliveredDms, channel, user, access.allowFrom, Date.now())) return
+  const rec = recordDeliveredDm(deliveredDms, channel, user, access.allowFrom, Date.now())
+  // A channel taken out of the set is also taken out of the DM-owner map, so
+  // a forged row (another channel bound to this user) stops working in this
+  // process too, not only after the next restart.
+  for (const ch of [...rec.rebound, ...rec.pruned]) dmOwners.forget(ch)
+  if (rec.rebound.length > 0) {
+    gateLog.append({ event: 'delivered_dms_rebind', dropped: rec.rebound.length })
+  }
+  if (!rec.changed) return
   try {
     saveDeliveredDms(DELIVERED_DMS_FILE, deliveredDms)
   } catch (err) {

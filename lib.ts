@@ -12,11 +12,16 @@ import { randomBytes } from 'node:crypto'
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   existsSync,
+  constants as fsConstants,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   statSync,
@@ -1014,6 +1019,7 @@ export function createDmOwnerResolver(
 ): {
   owners: ReadonlyMap<string, string>
   learn: (chatId: string, userId: string) => void
+  forget: (chatId: string) => void
   resolve: (chatId: string) => Promise<DmLookupOutcome>
 } {
   const owners = new Map<string, string>()
@@ -1021,6 +1027,11 @@ export function createDmOwnerResolver(
     owners,
     learn(chatId: string, userId: string): void {
       if (isDmChannelId(chatId) && userId) owners.set(chatId, userId)
+    },
+    // SLACKOUTDM1007 (2): drops a pair learned from the persisted file once a
+    // real DM shows that user's channel is another one.
+    forget(chatId: string): void {
+      owners.delete(chatId)
     },
     async resolve(chatId: string): Promise<DmLookupOutcome> {
       if (!isDmChannelId(chatId)) return 'not_dm'
@@ -1088,8 +1099,8 @@ export function parseDeliveredDm(row: unknown): DeliveredDm | null {
 export interface DeliveredDmsLoad {
   dms: Map<string, DeliveredDm>
   /** 'missing' = no file yet (normal on first boot); 'refused' = the file
-   *  itself was not read (symlink, not a regular file, other owner, too big,
-   *  bad JSON, wrong shape or version); 'ok' = read, rows checked one by one. */
+   *  as a whole was not trusted (see `reason`); 'ok' = read, rows checked
+   *  one by one. */
   status: 'missing' | 'refused' | 'ok'
   /** rows dropped as malformed */
   invalid: number
@@ -1099,33 +1110,42 @@ export interface DeliveredDmsLoad {
   reason?: string
 }
 
+// O_NOFOLLOW: a symlink at the path fails the open (ELOOP) instead of being
+// followed. O_NONBLOCK: a FIFO planted at the path cannot hang the boot in
+// open(); fstat then refuses it as not a regular file. Both are 0 where the
+// platform has no such flag (Windows), and there an lstat check stands in.
+const OPEN_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)
+
 /**
- * Reads the persisted allowFrom DMs. Never throws: a file that cannot be
- * trusted as a whole gives an empty set (`status: 'refused'`), a bad row is
- * dropped and the rest kept, and a row whose user is no longer in `allowFrom`
- * is dropped too (so taking a user out of allowFrom also drops the DM from
- * the next load, besides the gate's own per-send check).
+ * Reads the persisted allowFrom DMs. Never throws.
  *
- * `fs` is injectable for tests; `uid` is the expected file owner
- * (process.getuid() in production; undefined skips the owner check, as on
- * Windows where there is no uid).
+ * - The file is opened once without following a symlink, the checks
+ *   (regular file, owner) run on that open descriptor, and the same
+ *   descriptor is read, at most DELIVERED_DMS_MAX_BYTES + 1 bytes: what was
+ *   checked is what is read, and an oversized file is never read whole.
+ * - Whole file refused, empty set (`status: 'refused'`): symlink, not a
+ *   regular file, another owner, over DELIVERED_DMS_MAX_BYTES, bad JSON,
+ *   wrong shape or version, a channel listed twice, or one user bound to two
+ *   channels (a bot has exactly one DM with a given user, so a second channel
+ *   for the same user can only be a forged row).
+ * - Row dropped, rest kept: anything parseDeliveredDm refuses.
+ * - Row dropped: a user no longer in `allowFrom` (besides the gate's own
+ *   per-send allowFrom check).
+ *
+ * `uid` is the expected file owner (process.getuid() in production;
+ * undefined skips the owner check, as on Windows where there is no uid).
+ *
+ * The file is a trust input of the same class as access.json (THREAT-MODEL
+ * T5): a row that binds a stranger's DM channel to an allowFrom user's id is
+ * well-formed and is believed. Guarding the file against the session is the
+ * deployment's job, as it is for access.json.
  */
 export function loadDeliveredDms(
   filePath: string,
   allowFrom: readonly string[],
-  opts: {
-    uid?: number
-    lstat?: (p: string) => {
-      isFile(): boolean
-      isSymbolicLink(): boolean
-      uid: number
-      size: number
-    }
-    read?: (p: string) => string
-  } = {},
+  opts: { uid?: number } = {},
 ): DeliveredDmsLoad {
-  const lstat = opts.lstat ?? ((p: string) => lstatSync(p))
-  const read = opts.read ?? ((p: string) => readFileSync(p, 'utf-8'))
   const empty = (status: DeliveredDmsLoad['status'], reason?: string): DeliveredDmsLoad => ({
     dms: new Map(),
     status,
@@ -1133,20 +1153,39 @@ export function loadDeliveredDms(
     notAllowed: 0,
     ...(reason ? { reason } : {}),
   })
-  let st: ReturnType<typeof lstat>
+  let raw: string
+  let fd: number | undefined
   try {
-    st = lstat(filePath)
+    if (!fsConstants.O_NOFOLLOW && lstatSync(filePath).isSymbolicLink()) {
+      return empty('refused', 'symlink')
+    }
+    fd = openSync(filePath, OPEN_FLAGS)
+    const st = fstatSync(fd)
+    if (!st.isFile()) return empty('refused', 'not_a_file')
+    if (opts.uid !== undefined && st.uid !== opts.uid) return empty('refused', 'foreign_owner')
+    // A bounded read: at most one byte past the cap ever comes in, so an
+    // oversized (or growing) file is refused without being read whole.
+    const buf = Buffer.alloc(DELIVERED_DMS_MAX_BYTES + 1)
+    let n = 0
+    for (;;) {
+      const got = readSync(fd, buf, n, buf.length - n, null)
+      if (got <= 0) break
+      n += got
+      if (n >= buf.length) break
+    }
+    if (n > DELIVERED_DMS_MAX_BYTES) return empty('refused', 'too_big')
+    raw = buf.toString('utf-8', 0, n)
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code
-    return code === 'ENOENT' ? empty('missing') : empty('refused', 'stat_failed')
+    if (code === 'ENOENT') return empty('missing')
+    if (code === 'ELOOP') return empty('refused', 'symlink')
+    return empty('refused', 'open_failed')
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
-  if (st.isSymbolicLink()) return empty('refused', 'symlink')
-  if (!st.isFile()) return empty('refused', 'not_a_file')
-  if (opts.uid !== undefined && st.uid !== opts.uid) return empty('refused', 'foreign_owner')
-  if (st.size > DELIVERED_DMS_MAX_BYTES) return empty('refused', 'too_big')
   let doc: unknown
   try {
-    doc = JSON.parse(read(filePath))
+    doc = JSON.parse(raw)
   } catch {
     return empty('refused', 'bad_json')
   }
@@ -1157,12 +1196,18 @@ export function loadDeliveredDms(
   if (version !== DELIVERED_DMS_VERSION) return empty('refused', 'bad_version')
   if (!Array.isArray(dms)) return empty('refused', 'bad_shape')
   const out: DeliveredDmsLoad = { dms: new Map(), status: 'ok', invalid: 0, notAllowed: 0 }
+  const channels = new Set<string>()
+  const users = new Set<string>()
   for (const row of dms) {
     const dm = parseDeliveredDm(row)
     if (dm === null) {
       out.invalid++
       continue
     }
+    if (channels.has(dm.channel)) return empty('refused', 'channel_twice')
+    if (users.has(dm.user)) return empty('refused', 'user_twice')
+    channels.add(dm.channel)
+    users.add(dm.user)
     if (!allowFrom.includes(dm.user)) {
       out.notAllowed++
       continue
@@ -1194,12 +1239,29 @@ export function saveDeliveredDms(filePath: string, dms: ReadonlyMap<string, Deli
   }
 }
 
+/** What recordDeliveredDm changed. `dropped` lists the channels taken out of
+ *  the set, so the caller can also forget them in the DM-owner map. */
+export interface DeliveredDmRecord {
+  /** the set changed and should be saved */
+  changed: boolean
+  /** channels dropped because their user left allowFrom */
+  pruned: string[]
+  /** other channels bound to the user who just wrote from a real DM: a bot
+   *  has one DM per user, so these can only be stale or forged */
+  rebound: string[]
+}
+
 /**
  * Records a delivered inbound DM in `dms` when it qualifies: a `D...` channel
- * and a user who is in `allowFrom` right now. Returns true when the set
- * changed and should be saved: a new DM, or a known DM whose user differs, or
- * entries dropped because their user left allowFrom. A known DM keeps its
- * first `seenAt`, so the file is not rewritten on every message.
+ * and a user who is in `allowFrom` right now.
+ *
+ * - A DM written by that user is the truth about the user's DM channel: any
+ *   other channel bound to the same user is dropped (`rebound`). This heals
+ *   a forged row at the user's next real DM.
+ * - Entries whose user left allowFrom are dropped (`pruned`).
+ * - A known DM keeps its first `seenAt`, so the file is not rewritten on
+ *   every message: `changed` is true only for a new DM, a known DM with a
+ *   different user, or a drop.
  */
 export function recordDeliveredDm(
   dms: Map<string, DeliveredDm>,
@@ -1207,19 +1269,28 @@ export function recordDeliveredDm(
   user: string,
   allowFrom: readonly string[],
   now: number,
-): boolean {
-  let changed = false
+): DeliveredDmRecord {
+  const out: DeliveredDmRecord = { changed: false, pruned: [], rebound: [] }
   for (const [ch, dm] of dms) {
     if (!allowFrom.includes(dm.user)) {
       dms.delete(ch)
-      changed = true
+      out.pruned.push(ch)
+      out.changed = true
     }
   }
-  if (!isDmChannelId(channel) || !SLACK_USER_ID_RE.test(user)) return changed
-  if (!allowFrom.includes(user)) return changed
-  if (dms.get(channel)?.user === user) return changed
+  if (!isDmChannelId(channel) || !SLACK_USER_ID_RE.test(user)) return out
+  if (!allowFrom.includes(user)) return out
+  for (const [ch, dm] of dms) {
+    if (ch !== channel && dm.user === user) {
+      dms.delete(ch)
+      out.rebound.push(ch)
+      out.changed = true
+    }
+  }
+  if (dms.get(channel)?.user === user) return out
   dms.set(channel, { channel, user, seenAt: now })
-  return true
+  out.changed = true
+  return out
 }
 
 const TOKEN_RE = /xox[a-z]-[A-Za-z0-9-]+|xapp-[A-Za-z0-9-]+/g
