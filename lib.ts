@@ -13,6 +13,7 @@ import {
   appendFileSync,
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -1042,6 +1043,184 @@ export function createDmOwnerResolver(
 
 /** What a DM-owner lookup came to (SLACKLOOKUPLOG1007): for the gate log. */
 export type DmLookupOutcome = 'not_dm' | 'cached' | 'learned' | 'not_im' | 'error'
+
+// ---------------------------------------------------------------------------
+// SLACKOUTDM1007 (2): the allowFrom users' DMs survive a restart
+// ---------------------------------------------------------------------------
+// The DM-owner lookup needs the `im:read` scope, and a hand-made Slack app
+// often lacks it, so after a restart the owner's DM was refused again until
+// the owner wrote. The fix keeps, per agent (in its state dir), the DM
+// channels an allowFrom user has already written from. Not every delivered
+// thread: only `D...` channels, only allowFrom users. At boot the entries
+// teach the DM-owner map, and the gate decides exactly as before
+// (assertOutboundAllowed: the user must be in allowFrom on every send).
+
+/** One persisted DM: the channel, the allowFrom user who wrote from it, and
+ *  when that was first seen (epoch ms). Nothing else: no token, no text. */
+export interface DeliveredDm {
+  channel: string
+  user: string
+  seenAt: number
+}
+
+export const DELIVERED_DMS_VERSION = 1
+/** A file larger than this is not parsed at all (a few DMs are ~100 bytes). */
+export const DELIVERED_DMS_MAX_BYTES = 64 * 1024
+
+const SLACK_USER_ID_RE = /^[UW][A-Z0-9]{2,}$/
+const DELIVERED_DM_KEYS = ['channel', 'seenAt', 'user']
+
+/** One stored row, checked strictly: exactly the three keys, a DM channel id,
+ *  a user id, a positive integer timestamp. Anything else is null. */
+export function parseDeliveredDm(row: unknown): DeliveredDm | null {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) return null
+  const keys = Object.keys(row).sort()
+  if (keys.length !== DELIVERED_DM_KEYS.length) return null
+  if (keys.some((k, i) => k !== DELIVERED_DM_KEYS[i])) return null
+  const { channel, user, seenAt } = row as Record<string, unknown>
+  if (typeof channel !== 'string' || !isDmChannelId(channel)) return null
+  if (typeof user !== 'string' || !SLACK_USER_ID_RE.test(user)) return null
+  if (typeof seenAt !== 'number' || !Number.isSafeInteger(seenAt) || seenAt <= 0) return null
+  return { channel, user, seenAt }
+}
+
+/** What loadDeliveredDms found, for the gate log: counts only, no ids. */
+export interface DeliveredDmsLoad {
+  dms: Map<string, DeliveredDm>
+  /** 'missing' = no file yet (normal on first boot); 'refused' = the file
+   *  itself was not read (symlink, not a regular file, other owner, too big,
+   *  bad JSON, wrong shape or version); 'ok' = read, rows checked one by one. */
+  status: 'missing' | 'refused' | 'ok'
+  /** rows dropped as malformed */
+  invalid: number
+  /** rows dropped because the user is no longer in allowFrom */
+  notAllowed: number
+  /** why the file was refused, when status is 'refused' */
+  reason?: string
+}
+
+/**
+ * Reads the persisted allowFrom DMs. Never throws: a file that cannot be
+ * trusted as a whole gives an empty set (`status: 'refused'`), a bad row is
+ * dropped and the rest kept, and a row whose user is no longer in `allowFrom`
+ * is dropped too (so taking a user out of allowFrom also drops the DM from
+ * the next load, besides the gate's own per-send check).
+ *
+ * `fs` is injectable for tests; `uid` is the expected file owner
+ * (process.getuid() in production; undefined skips the owner check, as on
+ * Windows where there is no uid).
+ */
+export function loadDeliveredDms(
+  filePath: string,
+  allowFrom: readonly string[],
+  opts: {
+    uid?: number
+    lstat?: (p: string) => {
+      isFile(): boolean
+      isSymbolicLink(): boolean
+      uid: number
+      size: number
+    }
+    read?: (p: string) => string
+  } = {},
+): DeliveredDmsLoad {
+  const lstat = opts.lstat ?? ((p: string) => lstatSync(p))
+  const read = opts.read ?? ((p: string) => readFileSync(p, 'utf-8'))
+  const empty = (status: DeliveredDmsLoad['status'], reason?: string): DeliveredDmsLoad => ({
+    dms: new Map(),
+    status,
+    invalid: 0,
+    notAllowed: 0,
+    ...(reason ? { reason } : {}),
+  })
+  let st: ReturnType<typeof lstat>
+  try {
+    st = lstat(filePath)
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code
+    return code === 'ENOENT' ? empty('missing') : empty('refused', 'stat_failed')
+  }
+  if (st.isSymbolicLink()) return empty('refused', 'symlink')
+  if (!st.isFile()) return empty('refused', 'not_a_file')
+  if (opts.uid !== undefined && st.uid !== opts.uid) return empty('refused', 'foreign_owner')
+  if (st.size > DELIVERED_DMS_MAX_BYTES) return empty('refused', 'too_big')
+  let doc: unknown
+  try {
+    doc = JSON.parse(read(filePath))
+  } catch {
+    return empty('refused', 'bad_json')
+  }
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    return empty('refused', 'bad_shape')
+  }
+  const { version, dms } = doc as Record<string, unknown>
+  if (version !== DELIVERED_DMS_VERSION) return empty('refused', 'bad_version')
+  if (!Array.isArray(dms)) return empty('refused', 'bad_shape')
+  const out: DeliveredDmsLoad = { dms: new Map(), status: 'ok', invalid: 0, notAllowed: 0 }
+  for (const row of dms) {
+    const dm = parseDeliveredDm(row)
+    if (dm === null) {
+      out.invalid++
+      continue
+    }
+    if (!allowFrom.includes(dm.user)) {
+      out.notAllowed++
+      continue
+    }
+    out.dms.set(dm.channel, dm)
+  }
+  return out
+}
+
+/** Writes the set atomically: `<file>.tmp.<pid>` created 0o600 (exclusive),
+ *  chmod 0o600, then rename over the target. Throws on failure; the caller
+ *  decides (the server logs it and keeps going). */
+export function saveDeliveredDms(filePath: string, dms: ReadonlyMap<string, DeliveredDm>): void {
+  const rows = [...dms.values()].map(({ channel, user, seenAt }) => ({ channel, user, seenAt }))
+  const json = `${JSON.stringify({ version: DELIVERED_DMS_VERSION, dms: rows }, null, 2)}\n`
+  const tmp = `${filePath}.tmp.${process.pid}`
+  try {
+    unlinkSync(tmp)
+  } catch {}
+  try {
+    writeFileSync(tmp, json, { mode: 0o600, flag: 'wx' })
+    chmodSync(tmp, 0o600)
+    renameSync(tmp, filePath)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {}
+    throw err
+  }
+}
+
+/**
+ * Records a delivered inbound DM in `dms` when it qualifies: a `D...` channel
+ * and a user who is in `allowFrom` right now. Returns true when the set
+ * changed and should be saved: a new DM, or a known DM whose user differs, or
+ * entries dropped because their user left allowFrom. A known DM keeps its
+ * first `seenAt`, so the file is not rewritten on every message.
+ */
+export function recordDeliveredDm(
+  dms: Map<string, DeliveredDm>,
+  channel: string,
+  user: string,
+  allowFrom: readonly string[],
+  now: number,
+): boolean {
+  let changed = false
+  for (const [ch, dm] of dms) {
+    if (!allowFrom.includes(dm.user)) {
+      dms.delete(ch)
+      changed = true
+    }
+  }
+  if (!isDmChannelId(channel) || !SLACK_USER_ID_RE.test(user)) return changed
+  if (!allowFrom.includes(user)) return changed
+  if (dms.get(channel)?.user === user) return changed
+  dms.set(channel, { channel, user, seenAt: now })
+  return true
+}
 
 const TOKEN_RE = /xox[a-z]-[A-Za-z0-9-]+|xapp-[A-Za-z0-9-]+/g
 

@@ -159,6 +159,8 @@ All plugin state lives under `~/.claude/channels/slack/`. Files are mode `0o600`
 ├── .env                        # tokens (xoxb / xapp), SLACK_SENDABLE_ROOTS, SLACK_ACCESS_MODE   (0o600)
 ├── access.json                 # this file — allowlist, pairing codes, per-channel policy        (0o600)
 ├── inbox/                      # downloaded attachments, auto-allowed for re-share via `reply`   (0o700)
+├── delivered-dms.json          # DMs an allowFrom user wrote from (channel, user, seenAt); kept
+│                               #   across restarts so the owner DM stays an outbound target      (0o600)
 └── sessions/                   # per-thread conversation state (v0.5.0+)                          (0o700)
     ├── .migrated               # sentinel: migrator has run; future boots skip the scan          (0o600)
     ├── C0123456789/            # one directory per Slack channel ID
