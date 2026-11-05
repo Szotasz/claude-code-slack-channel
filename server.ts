@@ -37,6 +37,7 @@ import {
   claimAnswer,
   createDmOwnerResolver,
   createGateLog,
+  type DeliveredDm,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -54,6 +55,7 @@ import {
   deliveredThreadKey as libDeliveredThreadKey,
   gate as libGate,
   listSessions as libListSessions,
+  loadDeliveredDms,
   loadOwnThreads,
   matchPermissionReply,
   type PendingPolicyApproval,
@@ -63,11 +65,13 @@ import {
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
+  recordDeliveredDm,
   recordOwnPostTs,
   replyChunkBlocks,
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
+  saveDeliveredDms,
   slackErrorFields,
   validateAnswerButtons,
   validateSendableRoots,
@@ -553,6 +557,59 @@ const dmOwners = createDmOwnerResolver(
     gateLog.append({ event: 'dm_owner_lookup_failed', channel: chatId, ...fields })
   },
 )
+
+// SLACKOUTDM1007 (2): the DMs an allowFrom user has written from, kept in the
+// state dir so they survive a restart without the im:read lookup. Restored in
+// main() (after the audit journal is open, since getAccess() journals), and
+// fed into dmOwners: the gate itself is unchanged and still checks allowFrom
+// on every send. See loadDeliveredDms in lib.ts.
+const DELIVERED_DMS_FILE = join(STATE_DIR, 'delivered-dms.json')
+let deliveredDms = new Map<string, DeliveredDm>()
+
+function restoreDeliveredDms(): void {
+  const loaded = loadDeliveredDms(DELIVERED_DMS_FILE, getAccess().allowFrom, {
+    uid: typeof process.getuid === 'function' ? process.getuid() : undefined,
+  })
+  deliveredDms = loaded.dms
+  for (const dm of loaded.dms.values()) dmOwners.learn(dm.channel, dm.user)
+  // One line on every boot, also when the file does not exist yet (first boot
+  // after the deploy, before an allowFrom user wrote): then nothing is known,
+  // and the owner DM is refused exactly as before this change.
+  // Counts and the refusal reason only: no channel id, no user id.
+  const entry = {
+    event: 'delivered_dms_load',
+    status: loaded.status,
+    kept: loaded.dms.size,
+    invalid: loaded.invalid,
+    not_allowed: loaded.notAllowed,
+    ...(loaded.reason ? { reason: loaded.reason } : {}),
+  }
+  gateLog.append(entry)
+  if (loaded.status === 'refused' || loaded.invalid > 0) {
+    console.error('[slack] delivered-dms.json was not fully trusted', entry)
+  }
+}
+
+function rememberDeliveredDm(channel: string, user: string, access: Access): void {
+  const rec = recordDeliveredDm(deliveredDms, channel, user, access.allowFrom, Date.now())
+  // A channel taken out of the set is also taken out of the DM-owner map, so
+  // a forged row (another channel bound to this user) stops working in this
+  // process too, not only after the next restart.
+  for (const ch of [...rec.rebound, ...rec.pruned]) dmOwners.forget(ch)
+  if (rec.rebound.length > 0) {
+    gateLog.append({ event: 'delivered_dms_rebind', dropped: rec.rebound.length })
+  }
+  if (!rec.changed) return
+  try {
+    saveDeliveredDms(DELIVERED_DMS_FILE, deliveredDms)
+  } catch (err) {
+    // Best effort: a failed save must not drop the inbound message. The DM
+    // still works for this process (dmOwners learned it above).
+    const message = err instanceof Error ? err.message : String(err)
+    console.error('[slack] delivered-dms.json write failed', message)
+    gateLog.append({ event: 'delivered_dms_save_failed', message: message.slice(0, 200) })
+  }
+}
 
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
@@ -2505,6 +2562,8 @@ async function deliverEvent(
   // SLACKOUTDM1007: a delivered human DM tells us its user for free.
   if (ev.channel_type === 'im' && !ev.bot_id && typeof ev.user === 'string') {
     dmOwners.learn(channelId, ev.user)
+    // SLACKOUTDM1007 (2): an allowFrom user's DM is kept across restarts.
+    rememberDeliveredDm(channelId, ev.user, access)
   }
 
   journalWrite({
@@ -2945,6 +3004,10 @@ async function main(): Promise<void> {
     idleMs: resolveIdleMs(process.env),
     journal: journal ?? undefined,
   })
+
+  // SLACKOUTDM1007 (2): before Socket Mode and the MCP transport connect, so
+  // the first send after a restart already knows the allowFrom users' DMs.
+  restoreDeliveredDms()
 
   // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is
   // older than idleMs and no in-flight work, and drives quiesce → deactivate.

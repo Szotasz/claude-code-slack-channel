@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -28,6 +29,9 @@ import {
   buildAuditReceiptMessage,
   type ChannelPolicy,
   chunkText,
+  createDmOwnerResolver,
+  DELIVERED_DMS_MAX_BYTES,
+  DELIVERED_DMS_VERSION,
   defaultAccess,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
@@ -40,6 +44,7 @@ import {
   inPeerThread,
   isDuplicateEvent,
   isSlackFileUrl,
+  loadDeliveredDms,
   loadOwnThreads,
   loadSession,
   MAX_PAIRING_REPLIES,
@@ -50,14 +55,17 @@ import {
   OWN_THREADS_TTL_MS,
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
+  parseDeliveredDm,
   parseSendableRoots,
   pruneExpired,
+  recordDeliveredDm,
   recordOwnPostTs,
   resolveJournalPath,
   type Session,
   type SessionKey,
   sanitizeDisplayName,
   sanitizeFilename,
+  saveDeliveredDms,
   saveOwnThreads,
   saveSession,
   sessionPath,
@@ -1324,6 +1332,519 @@ describe('SLACKOUTDM1007 wiring in server.ts', () => {
       "if (ev.channel_type === 'im' && !ev.bot_id && typeof ev.user === 'string') {",
     )
     expect(src).toContain('dmOwners.learn(channelId, ev.user)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SLACKOUTDM1007 (2): the allowFrom users' DMs survive a restart
+// ---------------------------------------------------------------------------
+// The DM-owner lookup needs im:read, which a hand-made Slack app often lacks:
+// after a restart the owner's DM (reply, and also download_attachment for a
+// voice message) was refused until the owner wrote again. The DMs an
+// allowFrom user wrote from are now kept in <state dir>/delivered-dms.json.
+
+describe('SLACKOUTDM1007 (2) persisted allowFrom DMs', () => {
+  const OWNER = 'U0OWNER1'
+  const PEER = 'U0PEER22'
+  const STRANGER = 'U0STRANGE'
+  const OWNER_DM = 'D0OWNERDM'
+  const PEER_DM = 'D0PEERDM2'
+  const STRANGER_DM = 'D0STRANGR'
+  let dir: string
+  let file: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'slack-dms-'))
+    file = join(dir, 'delivered-dms.json')
+  })
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const write = (doc: unknown) => writeFileSync(file, JSON.stringify(doc), { mode: 0o600 })
+  const row = (channel: string, user: string, seenAt = 1_790_000_000_000) => ({
+    channel,
+    user,
+    seenAt,
+  })
+  const uid = () => statSync(dir).uid
+
+  describe('parseDeliveredDm', () => {
+    test('a well-formed row is kept as it is', () => {
+      expect(parseDeliveredDm(row(OWNER_DM, OWNER))).toEqual(row(OWNER_DM, OWNER))
+    })
+    test('a foreign key, a missing key or a non-object drops the row', () => {
+      expect(parseDeliveredDm({ ...row(OWNER_DM, OWNER), text: 'hi' })).toBeNull()
+      expect(parseDeliveredDm({ ...row(OWNER_DM, OWNER), token: 'x' })).toBeNull()
+      expect(parseDeliveredDm({ channel: OWNER_DM, user: OWNER })).toBeNull()
+      expect(parseDeliveredDm({ channel: OWNER_DM, user: OWNER, seen: 1 })).toBeNull()
+      expect(parseDeliveredDm(null)).toBeNull()
+      expect(parseDeliveredDm([OWNER_DM, OWNER, 1])).toBeNull()
+      expect(parseDeliveredDm('D0OWNERDM')).toBeNull()
+    })
+    test('only a D channel id counts', () => {
+      expect(parseDeliveredDm(row('C0CHANNEL', OWNER))).toBeNull()
+      expect(parseDeliveredDm(row('G0PRIVATE', OWNER))).toBeNull()
+      expect(parseDeliveredDm(row('d0lower', OWNER))).toBeNull()
+      expect(parseDeliveredDm(row('D', OWNER))).toBeNull()
+      expect(parseDeliveredDm(row(`${OWNER_DM}\n`, OWNER))).toBeNull()
+    })
+    test('the user must look like a Slack user id', () => {
+      expect(parseDeliveredDm(row(OWNER_DM, 'W0ENTERPR'))).not.toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, 'B0BOTID1'))).toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, 'u0lower'))).toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, ''))).toBeNull()
+      expect(parseDeliveredDm({ channel: OWNER_DM, user: 7, seenAt: 1 })).toBeNull()
+    })
+    test('seenAt must be a positive integer', () => {
+      expect(parseDeliveredDm(row(OWNER_DM, OWNER, 1))).not.toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, OWNER, 0))).toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, OWNER, -5))).toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, OWNER, 1.5))).toBeNull()
+      expect(parseDeliveredDm(row(OWNER_DM, OWNER, Number.NaN))).toBeNull()
+      expect(parseDeliveredDm({ channel: OWNER_DM, user: OWNER, seenAt: '1' })).toBeNull()
+    })
+  })
+
+  describe('loadDeliveredDms', () => {
+    test('no file yet: empty, status missing', () => {
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r.status).toBe('missing')
+      expect(r.dms.size).toBe(0)
+    })
+    test('keeps the good rows, drops a bad row and a user no longer in allowFrom', () => {
+      write({
+        version: DELIVERED_DMS_VERSION,
+        dms: [
+          row(OWNER_DM, OWNER),
+          row(PEER_DM, PEER),
+          { ...row('D0EXTRA01', OWNER), note: 'x' },
+          row('C0CHANNEL', OWNER),
+        ],
+      })
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r.status).toBe('ok')
+      expect([...r.dms.keys()]).toEqual([OWNER_DM])
+      expect(r.dms.get(OWNER_DM)).toEqual(row(OWNER_DM, OWNER))
+      expect(r.invalid).toBe(2)
+      expect(r.notAllowed).toBe(1)
+    })
+    test('a corrupt file gives an empty set without throwing', () => {
+      writeFileSync(file, '{"version":1,"dms":[', { mode: 0o600 })
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r).toMatchObject({ status: 'refused', reason: 'bad_json' })
+      expect(r.dms.size).toBe(0)
+    })
+    test('a wrong shape or version is refused as a whole', () => {
+      for (const [doc, reason] of [
+        [[row(OWNER_DM, OWNER)], 'bad_shape'],
+        [null, 'bad_shape'],
+        [{ version: DELIVERED_DMS_VERSION, dms: { [OWNER_DM]: OWNER } }, 'bad_shape'],
+        [{ version: 2, dms: [row(OWNER_DM, OWNER)] }, 'bad_version'],
+        [{ dms: [row(OWNER_DM, OWNER)] }, 'bad_version'],
+      ] as const) {
+        write(doc)
+        const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+        expect(r).toMatchObject({ status: 'refused', reason })
+        expect(r.dms.size).toBe(0)
+      }
+    })
+    test('a symlink is refused, even to a valid file', () => {
+      const real = join(dir, 'elsewhere.json')
+      writeFileSync(
+        real,
+        JSON.stringify({ version: DELIVERED_DMS_VERSION, dms: [row(OWNER_DM, OWNER)] }),
+      )
+      symlinkSync(real, file)
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r).toMatchObject({ status: 'refused', reason: 'symlink' })
+      expect(r.dms.size).toBe(0)
+    })
+    test('a file of another owner is refused', () => {
+      write({ version: DELIVERED_DMS_VERSION, dms: [row(OWNER_DM, OWNER)] })
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() + 1 })
+      expect(r).toMatchObject({ status: 'refused', reason: 'foreign_owner' })
+      expect(r.dms.size).toBe(0)
+      // without a uid (no POSIX owner) the owner check is skipped
+      expect(loadDeliveredDms(file, [OWNER]).dms.size).toBe(1)
+    })
+    test('a directory or an oversized file is refused', () => {
+      mkdirSync(file)
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({
+        status: 'refused',
+        reason: 'not_a_file',
+      })
+      rmSync(file, { recursive: true })
+      writeFileSync(file, ' '.repeat(DELIVERED_DMS_MAX_BYTES + 1))
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({
+        status: 'refused',
+        reason: 'too_big',
+      })
+    })
+    test('a file of exactly the cap is read, one byte more is refused', () => {
+      const body = JSON.stringify({ version: DELIVERED_DMS_VERSION, dms: [row(OWNER_DM, OWNER)] })
+      writeFileSync(file, body.padEnd(DELIVERED_DMS_MAX_BYTES, ' '), { mode: 0o600 })
+      expect(statSync(file).size).toBe(DELIVERED_DMS_MAX_BYTES)
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({ status: 'ok' })
+      writeFileSync(file, body.padEnd(DELIVERED_DMS_MAX_BYTES + 1, ' '), { mode: 0o600 })
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({
+        status: 'refused',
+        reason: 'too_big',
+      })
+    })
+    test('a file that cannot be opened is a refusal, not a crash', () => {
+      write({ version: DELIVERED_DMS_VERSION, dms: [row(OWNER_DM, OWNER)] })
+      chmodSync(file, 0o000)
+      try {
+        const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+        expect(r).toMatchObject({ status: 'refused', reason: 'open_failed' })
+        expect(r.dms.size).toBe(0)
+      } finally {
+        chmodSync(file, 0o600)
+      }
+    })
+    test('a FIFO at the path is refused without hanging the boot', () => {
+      const mk = Bun.spawnSync(['mkfifo', file])
+      expect(mk.exitCode).toBe(0)
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r).toMatchObject({ status: 'refused', reason: 'not_a_file' })
+    })
+    test('a channel listed twice, or one user bound to two channels, refuses the file', () => {
+      write({
+        version: DELIVERED_DMS_VERSION,
+        dms: [row(OWNER_DM, OWNER), row(OWNER_DM, PEER)],
+      })
+      expect(loadDeliveredDms(file, [OWNER, PEER], { uid: uid() })).toMatchObject({
+        status: 'refused',
+        reason: 'channel_twice',
+      })
+      // a bot has exactly one DM with a user: a second channel for the owner
+      // can only be forged, so the whole file is distrusted
+      write({
+        version: DELIVERED_DMS_VERSION,
+        dms: [row(OWNER_DM, OWNER), row(STRANGER_DM, OWNER)],
+      })
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r).toMatchObject({ status: 'refused', reason: 'user_twice' })
+      expect(r.dms.size).toBe(0)
+      // also when the doubled user has since left allowFrom
+      write({
+        version: DELIVERED_DMS_VERSION,
+        dms: [row(OWNER_DM, OWNER), row(PEER_DM, PEER), row(STRANGER_DM, PEER)],
+      })
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({
+        status: 'refused',
+        reason: 'user_twice',
+      })
+    })
+    test('a malformed row does not count towards the doubles', () => {
+      write({
+        version: DELIVERED_DMS_VERSION,
+        dms: [{ ...row(STRANGER_DM, OWNER), x: 1 }, row(OWNER_DM, OWNER)],
+      })
+      const r = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      expect(r).toMatchObject({ status: 'ok', invalid: 1 })
+      expect([...r.dms.keys()]).toEqual([OWNER_DM])
+    })
+  })
+
+  describe('saveDeliveredDms', () => {
+    test('writes 0600, only the three fields, and loads back the same', () => {
+      saveDeliveredDms(file, new Map([[OWNER_DM, row(OWNER_DM, OWNER)]]))
+      expect(statSync(file).mode & 0o777).toBe(0o600)
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+        version: DELIVERED_DMS_VERSION,
+        dms: [row(OWNER_DM, OWNER)],
+      })
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() }).dms.get(OWNER_DM)).toEqual(
+        row(OWNER_DM, OWNER),
+      )
+      expect(readdirSync(dir)).toEqual(['delivered-dms.json'])
+    })
+    test('a stray extra field on an entry is not written', () => {
+      const dm = { ...row(OWNER_DM, OWNER), text: 'secret' } as unknown as ReturnType<typeof row>
+      saveDeliveredDms(file, new Map([[OWNER_DM, dm]]))
+      expect(readFileSync(file, 'utf8')).not.toContain('secret')
+    })
+    test('replaces a symlink at the path instead of writing through it', () => {
+      const target = join(dir, 'target.txt')
+      writeFileSync(target, 'untouched')
+      symlinkSync(target, file)
+      saveDeliveredDms(file, new Map([[OWNER_DM, row(OWNER_DM, OWNER)]]))
+      expect(readFileSync(target, 'utf8')).toBe('untouched')
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() }).status).toBe('ok')
+    })
+    test('a failed write throws and leaves no tmp file', () => {
+      const missing = join(dir, 'no-such-dir', 'delivered-dms.json')
+      expect(() => saveDeliveredDms(missing, new Map())).toThrow()
+      expect(readdirSync(dir)).toEqual([])
+    })
+  })
+
+  describe('recordDeliveredDm', () => {
+    const none = { changed: false, pruned: [], rebound: [] }
+    test('records a DM written by an allowFrom user, once', () => {
+      const dms = new Map()
+      expect(recordDeliveredDm(dms, OWNER_DM, OWNER, [OWNER], 100)).toEqual({
+        ...none,
+        changed: true,
+      })
+      expect(dms.get(OWNER_DM)).toEqual(row(OWNER_DM, OWNER, 100))
+      // the next message changes nothing and keeps the first seenAt
+      expect(recordDeliveredDm(dms, OWNER_DM, OWNER, [OWNER], 200)).toEqual(none)
+      expect(dms.get(OWNER_DM)?.seenAt).toBe(100)
+    })
+    test('a user not in allowFrom, a channel, or a malformed id is not recorded', () => {
+      const dms = new Map()
+      expect(recordDeliveredDm(dms, STRANGER_DM, STRANGER, [OWNER], 1)).toEqual(none)
+      expect(recordDeliveredDm(dms, 'C0CHANNEL', OWNER, [OWNER], 1)).toEqual(none)
+      expect(recordDeliveredDm(dms, 'G0PRIVATE', OWNER, [OWNER], 1)).toEqual(none)
+      expect(recordDeliveredDm(dms, OWNER_DM, 'not-a-user', ['not-a-user'], 1)).toEqual(none)
+      expect(dms.size).toBe(0)
+    })
+    test('a user who left allowFrom is dropped at the next record', () => {
+      const dms = new Map([[PEER_DM, row(PEER_DM, PEER)]])
+      expect(recordDeliveredDm(dms, OWNER_DM, OWNER, [OWNER], 1)).toEqual({
+        changed: true,
+        pruned: [PEER_DM],
+        rebound: [],
+      })
+      expect([...dms.keys()]).toEqual([OWNER_DM])
+      // a drop alone (the new DM already known) still asks for a save
+      const dms2 = new Map([
+        [PEER_DM, row(PEER_DM, PEER)],
+        [OWNER_DM, row(OWNER_DM, OWNER)],
+      ])
+      expect(recordDeliveredDm(dms2, OWNER_DM, OWNER, [OWNER], 1)).toEqual({
+        changed: true,
+        pruned: [PEER_DM],
+        rebound: [],
+      })
+      expect([...dms2.keys()]).toEqual([OWNER_DM])
+    })
+    test('a known DM with a different user is updated', () => {
+      const dms = new Map([[OWNER_DM, row(OWNER_DM, PEER)]])
+      expect(recordDeliveredDm(dms, OWNER_DM, OWNER, [OWNER, PEER], 5)).toEqual({
+        ...none,
+        changed: true,
+      })
+      expect(dms.get(OWNER_DM)).toEqual(row(OWNER_DM, OWNER, 5))
+    })
+    test('a real DM from the user drops any other channel bound to that user', () => {
+      // a forged row bound a stranger's DM to the owner
+      const dms = new Map([[STRANGER_DM, row(STRANGER_DM, OWNER)]])
+      expect(recordDeliveredDm(dms, OWNER_DM, OWNER, [OWNER], 7)).toEqual({
+        changed: true,
+        pruned: [],
+        rebound: [STRANGER_DM],
+      })
+      expect([...dms.keys()]).toEqual([OWNER_DM])
+      // also when the real DM was already known
+      const dms2 = new Map([
+        [STRANGER_DM, row(STRANGER_DM, OWNER)],
+        [OWNER_DM, row(OWNER_DM, OWNER)],
+      ])
+      expect(recordDeliveredDm(dms2, OWNER_DM, OWNER, [OWNER], 7)).toEqual({
+        changed: true,
+        pruned: [],
+        rebound: [STRANGER_DM],
+      })
+      expect([...dms2.keys()]).toEqual([OWNER_DM])
+      // another user's DM is left alone
+      const dms3 = new Map([[PEER_DM, row(PEER_DM, PEER)]])
+      expect(recordDeliveredDm(dms3, OWNER_DM, OWNER, [OWNER, PEER], 7).rebound).toEqual([])
+      expect([...dms3.keys()].sort()).toEqual([OWNER_DM, PEER_DM].sort())
+    })
+  })
+
+  describe('restart simulation (record, save, new process, load, gate)', () => {
+    const access = (allowFrom: string[]) => makeAccess({ allowFrom, channels: {} })
+    // Process 1: the owner and a stranger wrote; only the owner is recorded.
+    const firstProcess = () => {
+      const dms = new Map()
+      recordDeliveredDm(dms, OWNER_DM, OWNER, [OWNER], 1_790_000_000_000)
+      recordDeliveredDm(dms, STRANGER_DM, STRANGER, [OWNER], 1_790_000_000_000)
+      saveDeliveredDms(file, dms)
+    }
+    // Process 2: empty deliveredThreads, no channel opted in, lookup failing
+    // (no im:read). The persisted DMs teach the owner map, as server.ts does.
+    const secondProcess = (allowFrom: string[]) => {
+      const loaded = loadDeliveredDms(file, allowFrom, { uid: uid() })
+      const owners = createDmOwnerResolver(async () => {
+        throw Object.assign(new Error('missing_scope'), { data: { error: 'missing_scope' } })
+      })
+      for (const dm of loaded.dms.values()) owners.learn(dm.channel, dm.user)
+      return (chatId: string, thread?: string) =>
+        assertOutboundAllowed(chatId, thread, access(allowFrom), new Set(), owners.owners)
+    }
+
+    test('the owner DM is writable after the restart, top-level and in a thread', () => {
+      firstProcess()
+      const gate = secondProcess([OWNER])
+      expect(() => gate(OWNER_DM)).not.toThrow()
+      expect(() => gate(OWNER_DM, '1790000000.000100')).not.toThrow()
+    })
+    test('a stranger DM and a channel stay refused', () => {
+      firstProcess()
+      const gate = secondProcess([OWNER])
+      expect(() => gate(STRANGER_DM)).toThrow('Outbound gate')
+      expect(() => gate('C0CHANNEL')).toThrow('Outbound gate')
+      expect(() => gate('G0PRIVATE')).toThrow('Outbound gate')
+    })
+    test('RESIDUAL (THREAT-MODEL T5): a trusted file binding a stranger DM to the owner is believed', () => {
+      // The file is a trust input like access.json. A row pairing a stranger's
+      // D channel with an allowFrom user's id is well-formed, so while the
+      // file is trusted that DM is an outbound target. Guarding the file
+      // against the session is the deployment's job (as for access.json);
+      // this test pins the limit so it is stated, not hidden.
+      write({ version: DELIVERED_DMS_VERSION, dms: [row(STRANGER_DM, OWNER)] })
+      expect(() => secondProcess([OWNER])(STRANGER_DM)).not.toThrow()
+    })
+    test('the forged binding stops at the owner next real DM (record + forget)', () => {
+      write({ version: DELIVERED_DMS_VERSION, dms: [row(STRANGER_DM, OWNER)] })
+      const loaded = loadDeliveredDms(file, [OWNER], { uid: uid() })
+      const owners = createDmOwnerResolver(async () => ({ ok: false }))
+      for (const dm of loaded.dms.values()) owners.learn(dm.channel, dm.user)
+      const gate = (chatId: string) =>
+        assertOutboundAllowed(chatId, undefined, access([OWNER]), new Set(), owners.owners)
+      expect(() => gate(STRANGER_DM)).not.toThrow()
+      // the owner writes from the real DM: what server.ts does on delivery
+      owners.learn(OWNER_DM, OWNER)
+      const rec = recordDeliveredDm(loaded.dms, OWNER_DM, OWNER, [OWNER], 9)
+      for (const ch of [...rec.rebound, ...rec.pruned]) owners.forget(ch)
+      expect(() => gate(STRANGER_DM)).toThrow('Outbound gate')
+      expect(() => gate(OWNER_DM)).not.toThrow()
+      saveDeliveredDms(file, loaded.dms)
+      expect([...loadDeliveredDms(file, [OWNER], { uid: uid() }).dms.keys()]).toEqual([OWNER_DM])
+    })
+    test('a hand-edited file naming a channel or a stranger opens nothing', () => {
+      write({
+        version: DELIVERED_DMS_VERSION,
+        dms: [row('C0CHANNEL', OWNER), row(STRANGER_DM, STRANGER)],
+      })
+      const gate = secondProcess([OWNER])
+      expect(() => gate('C0CHANNEL')).toThrow('Outbound gate')
+      expect(() => gate(STRANGER_DM)).toThrow('Outbound gate')
+    })
+    test('no file yet (first boot after the deploy): the owner DM is refused as before, no throw', () => {
+      expect(existsSync(file)).toBe(false)
+      let gate: ReturnType<typeof secondProcess> | undefined
+      expect(() => {
+        gate = secondProcess([OWNER])
+      }).not.toThrow()
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({
+        status: 'missing',
+        invalid: 0,
+        notAllowed: 0,
+      })
+      expect(() => gate?.(OWNER_DM)).toThrow('Outbound gate')
+      expect(() => gate?.(OWNER_DM, '1790000000.000100')).toThrow('Outbound gate')
+    })
+    test('a corrupt file refuses the owner DM too (as before this change)', () => {
+      writeFileSync(file, 'not json', { mode: 0o600 })
+      expect(() => secondProcess([OWNER])(OWNER_DM)).toThrow('Outbound gate')
+    })
+    test('a file of another owner refuses the owner DM', () => {
+      firstProcess()
+      const loaded = loadDeliveredDms(file, [OWNER], { uid: uid() + 1 })
+      expect(loaded.dms.size).toBe(0)
+    })
+    test('a user taken out of allowFrom loses the DM at the next load', () => {
+      firstProcess()
+      const loaded = loadDeliveredDms(file, [PEER], { uid: uid() })
+      expect(loaded.dms.size).toBe(0)
+      expect(loaded.notAllowed).toBe(1)
+      expect(() => secondProcess([PEER])(OWNER_DM)).toThrow('Outbound gate')
+    })
+    test('the file sits in the state dir, so no tool can send it as an attachment', () => {
+      firstProcess()
+      const inbox = join(dir, 'inbox')
+      mkdirSync(inbox)
+      expect(() => assertSendable(file, inbox, [dir], dir)).toThrow()
+    })
+  })
+})
+
+describe('SLACKOUTDM1007 (2) wiring in server.ts', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  test('the file lives in the state dir', () => {
+    expect(src).toContain("const DELIVERED_DMS_FILE = join(STATE_DIR, 'delivered-dms.json')")
+  })
+  test('the restore checks the file owner, uses the current allowFrom and teaches dmOwners', () => {
+    expect(src).toContain(
+      'const loaded = loadDeliveredDms(DELIVERED_DMS_FILE, getAccess().allowFrom, {',
+    )
+    expect(src).toContain(
+      "uid: typeof process.getuid === 'function' ? process.getuid() : undefined,",
+    )
+    expect(src).toContain(
+      'for (const dm of loaded.dms.values()) dmOwners.learn(dm.channel, dm.user)',
+    )
+  })
+  test('main restores before Socket Mode and the MCP transport connect', () => {
+    const main = src.slice(src.indexOf('async function main(): Promise<void> {'))
+    const restore = main.indexOf('restoreDeliveredDms()')
+    expect(restore).toBeGreaterThan(0)
+    expect(restore).toBeLessThan(main.indexOf('await socket.start()'))
+    expect(restore).toBeLessThan(main.indexOf('await mcp.connect(transport)'))
+    // after the journal opens (getAccess journals pairing events)
+    expect(restore).toBeGreaterThan(main.indexOf('journal = await JournalWriter.open({'))
+  })
+  test('only a delivered human DM is recorded, with the delivering access snapshot', () => {
+    const i = src.indexOf(
+      "if (ev.channel_type === 'im' && !ev.bot_id && typeof ev.user === 'string') {",
+    )
+    expect(i).toBeGreaterThan(0)
+    const branch = src.slice(i, src.indexOf('\n  }', i))
+    expect(branch).toContain('rememberDeliveredDm(channelId, ev.user, access)')
+    expect(src.split('rememberDeliveredDm(').length - 1).toBe(2) // definition + this call
+  })
+  test('a dropped channel is also forgotten in the DM-owner map, the rebind logged as a count', () => {
+    const fn = src.slice(src.indexOf('function rememberDeliveredDm('))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    expect(body).toContain('for (const ch of [...rec.rebound, ...rec.pruned]) dmOwners.forget(ch)')
+    expect(body).toContain(
+      "gateLog.append({ event: 'delivered_dms_rebind', dropped: rec.rebound.length })",
+    )
+    // forget runs before the early return for an unchanged set
+    expect(body.indexOf('dmOwners.forget(ch)')).toBeLessThan(
+      body.indexOf('if (!rec.changed) return'),
+    )
+  })
+  test('a failed save is logged and swallowed, never thrown into delivery', () => {
+    const fn = src.slice(src.indexOf('function rememberDeliveredDm('))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    expect(body).toContain('saveDeliveredDms(DELIVERED_DMS_FILE, deliveredDms)')
+    expect(body).toContain('} catch (err) {')
+    expect(body).not.toContain('throw')
+  })
+  test('the load is logged on every boot, also when the file does not exist yet', () => {
+    const fn = src.slice(src.indexOf('function restoreDeliveredDms('))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    expect(body).not.toMatch(/return\b/)
+    expect(body.indexOf('gateLog.append(entry)')).toBeGreaterThan(0)
+    // the stderr warning stays for a distrusted file only
+    expect(body).toContain("if (loaded.status === 'refused' || loaded.invalid > 0) {")
+  })
+  test('the load log carries counts only, no ids', () => {
+    const fn = src.slice(src.indexOf('function restoreDeliveredDms('))
+    const entry = fn.slice(
+      fn.indexOf("event: 'delivered_dms_load',"),
+      fn.indexOf('gateLog.append(entry)'),
+    )
+    expect(entry).not.toMatch(/channel|user|\.dms\b(?!\.size)/)
+  })
+  test('download_attachment, reply, react and edit_message share the DM-aware gate', () => {
+    for (const fn of [
+      'async function executeReply(',
+      'async function executeReact(',
+      'async function executeEditMessage(',
+      'async function executeDownloadAttachment(',
+    ]) {
+      const start = src.indexOf(fn)
+      expect(start).toBeGreaterThan(0)
+      const body = src.slice(start, src.indexOf('\n}\n', start))
+      expect(body).toContain('await ctx.assertOutboundAllowed(')
+      expect(body).not.toContain('assertOutboundAllowedNoDm')
+    }
   })
 })
 

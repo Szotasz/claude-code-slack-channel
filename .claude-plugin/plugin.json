@@ -1,6 +1,6 @@
 {
   "name": "slack-channel",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Two-way Slack channel for Claude Code — chat from Slack DMs and channels via Socket Mode",
   "author": {
     "name": "Jeremy Longshore",
