@@ -572,7 +572,9 @@ function restoreDeliveredDms(): void {
   })
   deliveredDms = loaded.dms
   for (const dm of loaded.dms.values()) dmOwners.learn(dm.channel, dm.user)
-  if (loaded.status === 'missing') return
+  // One line on every boot, also when the file does not exist yet (first boot
+  // after the deploy, before an allowFrom user wrote): then nothing is known,
+  // and the owner DM is refused exactly as before this change.
   // Counts and the refusal reason only: no channel id, no user id.
   const entry = {
     event: 'delivered_dms_load',

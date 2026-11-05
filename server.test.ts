@@ -1600,6 +1600,20 @@ describe('SLACKOUTDM1007 (2) persisted allowFrom DMs', () => {
       expect(() => gate('C0CHANNEL')).toThrow('Outbound gate')
       expect(() => gate(STRANGER_DM)).toThrow('Outbound gate')
     })
+    test('no file yet (first boot after the deploy): the owner DM is refused as before, no throw', () => {
+      expect(existsSync(file)).toBe(false)
+      let gate: ReturnType<typeof secondProcess> | undefined
+      expect(() => {
+        gate = secondProcess([OWNER])
+      }).not.toThrow()
+      expect(loadDeliveredDms(file, [OWNER], { uid: uid() })).toMatchObject({
+        status: 'missing',
+        invalid: 0,
+        notAllowed: 0,
+      })
+      expect(() => gate?.(OWNER_DM)).toThrow('Outbound gate')
+      expect(() => gate?.(OWNER_DM, '1790000000.000100')).toThrow('Outbound gate')
+    })
     test('a corrupt file refuses the owner DM too (as before this change)', () => {
       writeFileSync(file, 'not json', { mode: 0o600 })
       expect(() => secondProcess([OWNER])(OWNER_DM)).toThrow('Outbound gate')
@@ -1665,6 +1679,14 @@ describe('SLACKOUTDM1007 (2) wiring in server.ts', () => {
     expect(body).toContain('saveDeliveredDms(DELIVERED_DMS_FILE, deliveredDms)')
     expect(body).toContain('} catch (err) {')
     expect(body).not.toContain('throw')
+  })
+  test('the load is logged on every boot, also when the file does not exist yet', () => {
+    const fn = src.slice(src.indexOf('function restoreDeliveredDms('))
+    const body = fn.slice(0, fn.indexOf('\n}\n'))
+    expect(body).not.toMatch(/return\b/)
+    expect(body.indexOf('gateLog.append(entry)')).toBeGreaterThan(0)
+    // the stderr warning stays for a distrusted file only
+    expect(body).toContain("if (loaded.status === 'refused' || loaded.invalid > 0) {")
   })
   test('the load log carries counts only, no ids', () => {
     const fn = src.slice(src.indexOf('function restoreDeliveredDms('))
