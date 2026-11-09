@@ -11507,3 +11507,17 @@ describe('thread roots (SLACKTHREADROOT1109)', () => {
     expect(fetches).toBe(5)
   })
 })
+
+describe('SLACKTHREADROOT1109 wiring in server.ts', () => {
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  test('the production gate gets the cached root lookup', () => {
+    expect(src).toMatch(/const threadRootMentions = createThreadRootLookup\(/)
+    expect(src).toMatch(/return libGate\(event, \{[^}]*\n    threadRootMentions,\n  \}\)/)
+  })
+  test('the lookup reads exactly the root (limit 1, inclusive) and refuses a non-root answer', () => {
+    expect(src).toContain(
+      'await web.conversations.replies({ channel, ts: threadTs, limit: 1, inclusive: true })',
+    )
+    expect(src).toContain('if (!root || root.ts !== threadTs) return undefined')
+  })
+})
