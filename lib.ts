@@ -1537,6 +1537,20 @@ export interface GateOptions {
    *  thread_ts matches an entry bypass requireMention (unless the channel
    *  policy sets threadReplyAuto: false). Managed by the server layer. */
   ownPostedTimestamps?: ReadonlySet<string>
+  /** User IDs @-mentioned in a thread's ROOT message, or undefined when the
+   *  root cannot be read (fail-safe: each caller keeps its pre-lookup
+   *  behaviour). A thread reply event carries only `parent_user_id`, not the
+   *  root's text, so "the owner started this thread by tagging bot X" is only
+   *  visible through this lookup. Managed (and cached) by the server layer. */
+  threadRootMentions?: ThreadRootLookup
+}
+
+export type ThreadRootLookup = (channel: string, threadTs: string) => Promise<string[] | undefined>
+
+/** Thread reply (not the root itself): the cases the root lookup is about. */
+function isThreadReply(ev: Record<string, unknown>): boolean {
+  const threadTs = ev.thread_ts as string | undefined
+  return threadTs !== undefined && threadTs !== ev.ts
 }
 
 /**
@@ -1629,7 +1643,10 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
  * Block 5 helper — channel opt-in check, allowFrom filter, and requireMention
  * guard.
  */
-function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): GateResult {
+async function handleChannelEvent(
+  ev: Record<string, unknown>,
+  opts: GateOptions,
+): Promise<GateResult> {
   const { access, botUserId } = opts
   const channel = ev.channel as string
   const policy = access.channels[channel]
@@ -1644,7 +1661,20 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     const autoDeliver =
       policy.threadReplyAuto !== false &&
       threadTs !== undefined &&
-      opts.ownPostedTimestamps?.has(threadTs) === true
+      (opts.ownPostedTimestamps?.has(threadTs) === true ||
+        // SLACKTHREADROOT1109: a thread whose ROOT tags this bot is this
+        // bot's conversation too, even when a human posted the root ("@Marveen
+        // ..." + replies without a tag). An unreadable root keeps the drop.
+        // A reply that is itself addressed to someone else by the top-level
+        // rule ("<@BONI> nezd meg") is not auto-delivered through the root:
+        // before this branch it was dropped here, and it still is. With no
+        // mentionPeers that is any other mention; skipWhenOthersMentioned:
+        // false turns the narrowing off.
+        (!(
+          policy.skipWhenOthersMentioned !== false &&
+          addressedToOthers(ev, botUserId, policy.mentionPeers)
+        ) &&
+          (await rootMentionsSelf(ev, channel, threadTs, opts))))
     if (!autoDeliver) return { action: 'drop' }
   }
 
@@ -1665,7 +1695,52 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
     return { action: 'drop' }
   }
 
+  // SLACKTHREADROOT1109: the same for a thread a HUMAN started by tagging a
+  // peer ("@Marveen ..."): the untagged replies in it are addressed to that
+  // peer, not to the bot that reads everything. Decided on the root's
+  // mentions with the same rule as a top-level message (addressedToOthers).
+  if (
+    !policy.requireMention &&
+    skipOthers &&
+    (await inPeerAddressedThread(ev, channel, botUserId, policy.mentionPeers, opts))
+  ) {
+    return { action: 'drop' }
+  }
+
   return { action: 'deliver', access }
+}
+
+/** True when this thread reply's root @-mentions this bot (via the lookup). */
+async function rootMentionsSelf(
+  ev: Record<string, unknown>,
+  channel: string,
+  threadTs: string,
+  opts: GateOptions,
+): Promise<boolean> {
+  if (!opts.botUserId || !opts.threadRootMentions || !isThreadReply(ev)) return false
+  const ids = await opts.threadRootMentions(channel, threadTs)
+  return ids?.includes(opts.botUserId) === true
+}
+
+/**
+ * True when the message is an untagged thread reply in a thread whose root
+ * was posted by someone other than this bot and is addressed to others by
+ * the top-level rule (it tags a peer and not this bot). Fails open (false)
+ * without our own id, without a lookup, or when the root cannot be read.
+ */
+export async function inPeerAddressedThread(
+  event: Record<string, unknown>,
+  channel: string,
+  botUserId: string,
+  peers: readonly string[] | undefined,
+  opts: Pick<GateOptions, 'threadRootMentions'>,
+): Promise<boolean> {
+  if (!botUserId || !opts.threadRootMentions || !isThreadReply(event)) return false
+  if (event.parent_user_id === botUserId) return false
+  if (isMentioned(event, botUserId)) return false
+  const ids = await opts.threadRootMentions(channel, event.thread_ts as string)
+  if (!ids) return false
+  return addressedToOthers({ text: ids.map((id) => `<@${id}>`).join(' ') }, botUserId, peers)
 }
 
 /**
@@ -1707,7 +1782,7 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   if (ev.channel_type === 'im') return handleDmEvent(ev, opts)
 
   // 5. Channel handling — opt-in per channel ID
-  return handleChannelEvent(ev, opts)
+  return await handleChannelEvent(ev, opts)
 }
 
 /** User IDs @-mentioned in the message text (`<@U123>` or `<@U123|name>`). */
@@ -1744,6 +1819,60 @@ function isMentioned(event: Record<string, unknown>, botUserId: string): boolean
   if (!botUserId) return false
   const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
+}
+
+// ---------------------------------------------------------------------------
+// Thread-root mention lookup (SLACKTHREADROOT1109)
+// ---------------------------------------------------------------------------
+
+export const THREAD_ROOT_CACHE_MAX = 500
+export const THREAD_ROOT_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Wrap a root-text fetcher into a cached ThreadRootLookup. A root's mentions
+ * are read once per (channel, thread) and kept for the TTL, bounded to `max`
+ * entries (oldest evicted first). A failed fetch (an error, or no root found) is NOT cached, so a
+ * transient API error does not pin the fail-safe answer for a whole day.
+ */
+export function createThreadRootLookup(
+  fetchRootText: (channel: string, threadTs: string) => Promise<string | undefined>,
+  opts: { max?: number; ttlMs?: number; now?: () => number } = {},
+): ThreadRootLookup {
+  const max = opts.max ?? THREAD_ROOT_CACHE_MAX
+  const ttlMs = opts.ttlMs ?? THREAD_ROOT_CACHE_TTL_MS
+  const now = opts.now ?? Date.now
+  // The entry holds the PROMISE, stored before the fetch resolves: two quick
+  // replies in a new thread share one fetch instead of racing two (and the
+  // awaiting handlers resume in arrival order). A failed fetch removes its
+  // own entry, so it is retried next time.
+  const cache = new Map<string, { ids: Promise<string[] | undefined>; at: number }>()
+  return (channel, threadTs) => {
+    const key = `${channel}:${threadTs}`
+    const hit = cache.get(key)
+    if (hit && now() - hit.at < ttlMs) return hit.ids
+    cache.delete(key)
+    const entry = { ids: Promise.resolve<string[] | undefined>(undefined), at: now() }
+    entry.ids = (async () => {
+      let text: string | undefined
+      try {
+        text = await fetchRootText(channel, threadTs)
+      } catch {
+        text = undefined
+      }
+      if (text === undefined) {
+        if (cache.get(key) === entry) cache.delete(key)
+        return undefined
+      }
+      return mentionedUserIds(text)
+    })()
+    cache.set(key, entry)
+    while (cache.size > max) {
+      const oldest = cache.keys().next().value
+      if (oldest === undefined) break
+      cache.delete(oldest)
+    }
+    return entry.ids
+  }
 }
 
 // ---------------------------------------------------------------------------
