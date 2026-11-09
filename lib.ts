@@ -1665,7 +1665,16 @@ async function handleChannelEvent(
         // SLACKTHREADROOT1109: a thread whose ROOT tags this bot is this
         // bot's conversation too, even when a human posted the root ("@Marveen
         // ..." + replies without a tag). An unreadable root keeps the drop.
-        (await rootMentionsSelf(ev, channel, threadTs, opts)))
+        // A reply that is itself addressed to someone else by the top-level
+        // rule ("<@BONI> nezd meg") is not auto-delivered through the root:
+        // before this branch it was dropped here, and it still is. With no
+        // mentionPeers that is any other mention; skipWhenOthersMentioned:
+        // false turns the narrowing off.
+        (!(
+          policy.skipWhenOthersMentioned !== false &&
+          addressedToOthers(ev, botUserId, policy.mentionPeers)
+        ) &&
+          (await rootMentionsSelf(ev, channel, threadTs, opts))))
     if (!autoDeliver) return { action: 'drop' }
   }
 
@@ -1832,27 +1841,37 @@ export function createThreadRootLookup(
   const max = opts.max ?? THREAD_ROOT_CACHE_MAX
   const ttlMs = opts.ttlMs ?? THREAD_ROOT_CACHE_TTL_MS
   const now = opts.now ?? Date.now
-  const cache = new Map<string, { ids: string[]; at: number }>()
-  return async (channel, threadTs) => {
+  // The entry holds the PROMISE, stored before the fetch resolves: two quick
+  // replies in a new thread share one fetch instead of racing two (and the
+  // awaiting handlers resume in arrival order). A failed fetch removes its
+  // own entry, so it is retried next time.
+  const cache = new Map<string, { ids: Promise<string[] | undefined>; at: number }>()
+  return (channel, threadTs) => {
     const key = `${channel}:${threadTs}`
     const hit = cache.get(key)
     if (hit && now() - hit.at < ttlMs) return hit.ids
     cache.delete(key)
-    let text: string | undefined
-    try {
-      text = await fetchRootText(channel, threadTs)
-    } catch {
-      return undefined
-    }
-    if (text === undefined) return undefined
-    const ids = mentionedUserIds(text)
-    cache.set(key, { ids, at: now() })
+    const entry = { ids: Promise.resolve<string[] | undefined>(undefined), at: now() }
+    entry.ids = (async () => {
+      let text: string | undefined
+      try {
+        text = await fetchRootText(channel, threadTs)
+      } catch {
+        text = undefined
+      }
+      if (text === undefined) {
+        if (cache.get(key) === entry) cache.delete(key)
+        return undefined
+      }
+      return mentionedUserIds(text)
+    })()
+    cache.set(key, entry)
     while (cache.size > max) {
       const oldest = cache.keys().next().value
       if (oldest === undefined) break
       cache.delete(oldest)
     }
-    return ids
+    return entry.ids
   }
 }
 

@@ -11408,6 +11408,40 @@ describe('thread roots (SLACKTHREADROOT1109)', () => {
     expect(calls).toHaveLength(0)
   })
 
+  test('main: a reply addressed to a peer is NOT auto-delivered through the root (Dani review): only the peer gets it', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate(reply('<@U_BONI> nezd meg'), mainOpts(lookup))).action).toBe('drop')
+    expect((await gate(reply('<@U_BONI> nezd meg'), boniOpts(lookup))).action).toBe('deliver')
+    // the narrowing is decided before the lookup
+    expect(calls).toHaveLength(0)
+  })
+
+  test('main: without mentionPeers any other mention narrows; with mentionPeers only a peer does; the switch turns it off', async () => {
+    const { lookup } = rootSays('<@U_MAIN> hangüzenet')
+    const toColleague = reply('<@U_COLLEAGUE> mit gondolsz?')
+    expect((await gate(toColleague, mainOpts(lookup))).action).toBe('drop')
+    expect((await gate(toColleague, mainOpts(lookup, { mentionPeers: PEERS }))).action).toBe(
+      'deliver',
+    )
+    expect(
+      (await gate(reply('<@U_IRIS> nezd meg'), mainOpts(lookup, { mentionPeers: PEERS }))).action,
+    ).toBe('drop')
+    expect(
+      (
+        await gate(
+          reply('<@U_BONI> nezd meg'),
+          mainOpts(lookup, { skipWhenOthersMentioned: false }),
+        )
+      ).action,
+    ).toBe('deliver')
+  })
+
+  test('main: the own-post rule is unchanged: a reply under our own post that tags a peer still arrives', async () => {
+    const own = mainOpts(rootSays('<@U_MAIN> x').lookup)
+    own.ownPostedTimestamps = new Set([ROOT])
+    expect((await gate(reply('<@U_BONI> nezd meg'), own)).action).toBe('deliver')
+  })
+
   // -- the read-everything side (the bot the root did NOT tag) --
 
   test('boni: a reply that tags Boni still arrives under a root that tags a peer', async () => {
@@ -11464,6 +11498,45 @@ describe('thread roots (SLACKTHREADROOT1109)', () => {
     expect(await look('C_GEN', ROOT)).toEqual(['U_MAIN', 'U_IRIS'])
     expect(fetches).toBe(1)
     expect(await look('C_OTHER', ROOT)).toBeUndefined()
+    expect(fetches).toBe(2)
+  })
+
+  test('createThreadRootLookup: two replies racing in a new thread share one fetch and keep their order (Dani review)', async () => {
+    let fetches = 0
+    let release: (t: string) => void = () => {}
+    const look = createThreadRootLookup(
+      () =>
+        new Promise<string>((res) => {
+          fetches++
+          release = res
+        }),
+    )
+    const opts = mainOpts(look)
+    const order: string[] = []
+    const first = gate(reply('elso'), opts).then((r) => order.push(`elso:${r.action}`))
+    const second = gate({ ...reply('masodik'), ts: '1794250100.000200' }, opts).then((r) =>
+      order.push(`masodik:${r.action}`),
+    )
+    await Promise.resolve()
+    release('<@U_MAIN> hangüzenet')
+    await Promise.all([first, second])
+    expect(fetches).toBe(1)
+    expect(order).toEqual(['elso:deliver', 'masodik:deliver'])
+  })
+
+  test('createThreadRootLookup: a failed in-flight fetch is shared, then retried', async () => {
+    let fetches = 0
+    let fail = true
+    const look = createThreadRootLookup(async () => {
+      fetches++
+      await Promise.resolve()
+      if (fail) throw new Error('ratelimited')
+      return '<@U_MAIN> x'
+    })
+    const [a, b] = await Promise.all([look('C_GEN', ROOT), look('C_GEN', ROOT)])
+    expect([a, b, fetches]).toEqual([undefined, undefined, 1])
+    fail = false
+    expect(await look('C_GEN', ROOT)).toEqual(['U_MAIN'])
     expect(fetches).toBe(2)
   })
 
