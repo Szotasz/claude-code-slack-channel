@@ -37,6 +37,7 @@ import {
   claimAnswer,
   createDmOwnerResolver,
   createGateLog,
+  createThreadRootLookup,
   type DeliveredDm,
   decidePermissionRoute,
   defaultAccess,
@@ -707,6 +708,17 @@ function journalWrite(
 // Gate function (wires up getAccess/saveAccess/botUserId for production use)
 // ---------------------------------------------------------------------------
 
+// SLACKTHREADROOT1109: a thread reply event does not carry the root's text, so
+// "who did the root tag" is read once per thread (cached in lib) from the root
+// itself. Any error or a missing root returns undefined: the gate then keeps
+// its old behaviour for that reply.
+const threadRootMentions = createThreadRootLookup(async (channel, threadTs) => {
+  const res = await web.conversations.replies({ channel, ts: threadTs, limit: 1, inclusive: true })
+  const root = res.messages?.[0]
+  if (!root || root.ts !== threadTs) return undefined
+  return root.text ?? ''
+})
+
 async function gate(event: unknown): Promise<GateResult> {
   return libGate(event, {
     access: getAccess(),
@@ -716,6 +728,7 @@ async function gate(event: unknown): Promise<GateResult> {
     selfBotId,
     selfAppId,
     ownPostedTimestamps,
+    threadRootMentions,
   })
 }
 

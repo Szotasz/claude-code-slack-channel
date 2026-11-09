@@ -30,6 +30,7 @@ import {
   type ChannelPolicy,
   chunkText,
   createDmOwnerResolver,
+  createThreadRootLookup,
   DELIVERED_DMS_MAX_BYTES,
   DELIVERED_DMS_VERSION,
   defaultAccess,
@@ -41,6 +42,7 @@ import {
   gate,
   generateCode,
   generateCorrelationId,
+  inPeerAddressedThread,
   inPeerThread,
   isDuplicateEvent,
   isSlackFileUrl,
@@ -11295,5 +11297,213 @@ describe('peer threads', () => {
     expect(
       inPeerThread({ ...reply('x', 'U_IRIS'), ts: '1711000000.000100' }, 'U_BOT', ['U_IRIS']),
     ).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Thread roots: a thread a HUMAN started by tagging a bot belongs to that bot
+// (SLACKTHREADROOT1109, measured C0C791MC3R7 2026-11-09: the owner posted
+// "<@Marveen> + voice message", then answered in the thread without a tag;
+// the main bot (requireMention: true) dropped every reply because the root
+// was not its own post, and Boni (requireMention: false, mentionPeers) got
+// them all because a human-rooted thread was never a "peer thread").
+// ---------------------------------------------------------------------------
+
+describe('thread roots (SLACKTHREADROOT1109)', () => {
+  const ROOT = '1794250008.936809'
+  const PEERS = ['U_MAIN', 'U_IRIS']
+  const reply = (text: string, parent = 'U_OWNER') => ({
+    user: 'U_OWNER',
+    channel: 'C_GEN',
+    channel_type: 'channel',
+    text,
+    ts: '1794250100.000100',
+    thread_ts: ROOT,
+    parent_user_id: parent,
+  })
+  /** A lookup that answers from a fixed root text and counts its calls. */
+  const rootSays = (text: string | undefined) => {
+    const calls: Array<[string, string]> = []
+    const lookup = async (channel: string, threadTs: string) => {
+      calls.push([channel, threadTs])
+      return text === undefined ? undefined : mentionedUserIds(text)
+    }
+    return { lookup, calls }
+  }
+  // The two bots of the measured case, with their measured channel policies.
+  const mainOpts = (
+    lookup?: GateOptions['threadRootMentions'],
+    policy: Record<string, unknown> = {},
+  ) =>
+    makeOpts({
+      access: makeAccess({
+        channels: { C_GEN: { requireMention: true, allowFrom: ['U_OWNER'], ...policy } },
+      }),
+      botUserId: 'U_MAIN',
+      ownPostedTimestamps: new Set(),
+      threadRootMentions: lookup,
+    })
+  const boniOpts = (
+    lookup?: GateOptions['threadRootMentions'],
+    policy: Record<string, unknown> = {},
+  ) =>
+    makeOpts({
+      access: makeAccess({
+        channels: {
+          C_GEN: { requireMention: false, allowFrom: ['U_OWNER'], mentionPeers: PEERS, ...policy },
+        },
+      }),
+      botUserId: 'U_BONI',
+      threadRootMentions: lookup,
+    })
+
+  test('the measured case, both sides: an untagged reply under the owner\'s "<@MAIN>" root reaches MAIN, not Boni', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate(reply('es meg ez'), mainOpts(lookup))).action).toBe('deliver')
+    expect((await gate(reply('es meg ez'), boniOpts(lookup))).action).toBe('drop')
+    expect(calls).toEqual([
+      ['C_GEN', ROOT],
+      ['C_GEN', ROOT],
+    ])
+  })
+
+  // -- the requireMention: true side (the bot the root tagged) --
+
+  test('main: a root that tags someone else keeps the drop', async () => {
+    const { lookup } = rootSays('<@U_IRIS> nezd meg')
+    expect((await gate(reply('valasz'), mainOpts(lookup))).action).toBe('drop')
+  })
+
+  test('main: an unreadable root keeps the drop (old behaviour), and so does a missing lookup', async () => {
+    expect((await gate(reply('valasz'), mainOpts(rootSays(undefined).lookup))).action).toBe('drop')
+    expect((await gate(reply('valasz'), mainOpts(undefined))).action).toBe('drop')
+  })
+
+  test('main: threadReplyAuto: false still requires a tag, even under a root that tags this bot', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate(reply('valasz'), mainOpts(lookup, { threadReplyAuto: false }))).action).toBe(
+      'drop',
+    )
+    expect(calls).toHaveLength(0)
+  })
+
+  test('main: no lookup for a tagged reply, an own-post thread, or a top-level message', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate(reply('<@U_MAIN> te'), mainOpts(lookup))).action).toBe('deliver')
+    const own = mainOpts(lookup)
+    own.ownPostedTimestamps = new Set([ROOT])
+    expect((await gate(reply('valasz'), own)).action).toBe('deliver')
+    const top = { ...reply('mi a helyzet?'), ts: '1794250200.000100', thread_ts: undefined }
+    expect((await gate(top, mainOpts(lookup))).action).toBe('drop')
+    // the root message itself, re-sent with thread_ts === ts, is not a reply
+    expect((await gate({ ...reply('x'), ts: ROOT }, mainOpts(lookup))).action).toBe('drop')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('main: allowFrom still applies before the root lookup', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate({ ...reply('valasz'), user: 'U_STRANGER' }, mainOpts(lookup))).action).toBe(
+      'drop',
+    )
+    expect(calls).toHaveLength(0)
+  })
+
+  // -- the read-everything side (the bot the root did NOT tag) --
+
+  test('boni: a reply that tags Boni still arrives under a root that tags a peer', async () => {
+    const { lookup } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate(reply('<@U_BONI> te is'), boniOpts(lookup))).action).toBe('deliver')
+  })
+
+  test('boni: a root that tags Boni AND a peer, nobody, or only a human colleague keeps delivering', async () => {
+    for (const root of ['<@U_BONI> <@U_MAIN> ketten', 'csak ugy kerdezem', '<@U_COLLEAGUE> szia']) {
+      expect((await gate(reply('valasz'), boniOpts(rootSays(root).lookup))).action).toBe('deliver')
+    }
+  })
+
+  test('boni: an unreadable root, or no lookup, fails OPEN (delivers, as before)', async () => {
+    expect((await gate(reply('valasz'), boniOpts(rootSays(undefined).lookup))).action).toBe(
+      'deliver',
+    )
+    expect((await gate(reply('valasz'), boniOpts(undefined))).action).toBe('deliver')
+  })
+
+  test('boni: its own thread is never looked up, even if the root tagged a peer', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect((await gate(reply('valasz', 'U_BONI'), boniOpts(lookup))).action).toBe('deliver')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('boni: the rule follows the existing switch: no mentionPeers or skipWhenOthersMentioned: false keeps delivering', async () => {
+    const { lookup } = rootSays('<@U_MAIN> hangüzenet')
+    expect(
+      (await gate(reply('valasz'), boniOpts(lookup, { mentionPeers: undefined }))).action,
+    ).toBe('deliver')
+    expect(
+      (await gate(reply('valasz'), boniOpts(lookup, { skipWhenOthersMentioned: false }))).action,
+    ).toBe('deliver')
+  })
+
+  test('inPeerAddressedThread fails open without our own id', async () => {
+    const { lookup, calls } = rootSays('<@U_MAIN> hangüzenet')
+    expect(
+      await inPeerAddressedThread(reply('x'), 'C_GEN', '', PEERS, { threadRootMentions: lookup }),
+    ).toBe(false)
+    expect(calls).toHaveLength(0)
+  })
+
+  // -- the cached lookup the server wires in --
+
+  test('createThreadRootLookup reads a root once per thread and returns its mentions', async () => {
+    let fetches = 0
+    const look = createThreadRootLookup(async (channel, ts) => {
+      fetches++
+      return channel === 'C_GEN' && ts === ROOT ? '<@U_MAIN> hangüzenet <@U_IRIS|iris>' : undefined
+    })
+    expect(await look('C_GEN', ROOT)).toEqual(['U_MAIN', 'U_IRIS'])
+    expect(await look('C_GEN', ROOT)).toEqual(['U_MAIN', 'U_IRIS'])
+    expect(fetches).toBe(1)
+    expect(await look('C_OTHER', ROOT)).toBeUndefined()
+    expect(fetches).toBe(2)
+  })
+
+  test('createThreadRootLookup does not cache a failure or a missing root', async () => {
+    let fetches = 0
+    let fail = true
+    const look = createThreadRootLookup(async () => {
+      fetches++
+      if (fail) throw new Error('ratelimited')
+      return '<@U_MAIN> x'
+    })
+    expect(await look('C_GEN', ROOT)).toBeUndefined()
+    fail = false
+    expect(await look('C_GEN', ROOT)).toEqual(['U_MAIN'])
+    expect(fetches).toBe(2)
+  })
+
+  test('createThreadRootLookup expires entries after the TTL and keeps at most `max`', async () => {
+    let t = 0
+    let fetches = 0
+    const look = createThreadRootLookup(
+      async (_c, ts) => {
+        fetches++
+        return `<@U_${ts.replace('.', '')}>`
+      },
+      { max: 2, ttlMs: 1000, now: () => t },
+    )
+    await look('C', '1.1')
+    t = 999
+    await look('C', '1.1')
+    expect(fetches).toBe(1)
+    t = 1000
+    await look('C', '1.1')
+    expect(fetches).toBe(2)
+    await look('C', '2.2')
+    await look('C', '3.3') // evicts 1.1, the oldest
+    await look('C', '3.3')
+    await look('C', '2.2')
+    expect(fetches).toBe(4)
+    await look('C', '1.1')
+    expect(fetches).toBe(5)
   })
 })
