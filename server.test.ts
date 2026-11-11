@@ -5021,17 +5021,17 @@ describe('extractManifests (31-A.2)', () => {
     // produce a valid manifest. Proves the whitespace padding hasn't
     // broken the payload shape.
     expect(ManifestV1.safeParse(JSON.parse(padded)).success).toBe(true)
-    // Silence console.debug during this assertion so the DoS-signal log
-    // line doesn't pollute test output. Restore it after.
-    const origDebug = console.debug
+    // Capture console.error (stderr: stdout is the MCP stream, SLACKDUP1111)
+    // so the DoS-signal log line doesn't pollute test output. Restore it after.
+    const origError = console.error
     const debugCalls: unknown[][] = []
-    console.debug = (...args: unknown[]) => {
+    console.error = (...args: unknown[]) => {
       debugCalls.push(args)
     }
     try {
       expect(extractManifests([padded])).toEqual([])
     } finally {
-      console.debug = origDebug
+      console.error = origError
     }
     // The log must reference the oversize condition so an operator
     // grepping logs for DoS signals can find it.
@@ -5067,15 +5067,15 @@ describe('extractManifests (31-A.2)', () => {
     expect(totalBytes).toBeGreaterThan(MAX_MANIFEST_BYTES)
     // UTF-16 length is much smaller: baseBytes + 1 + 2*emojisNeeded.
     expect(tooBig.length).toBeLessThan(totalBytes)
-    const origDebug = console.debug
+    const origError = console.error
     const debugCalls: unknown[][] = []
-    console.debug = (...args: unknown[]) => {
+    console.error = (...args: unknown[]) => {
       debugCalls.push(args)
     }
     try {
       expect(extractManifests([tooBig])).toEqual([])
     } finally {
-      console.debug = origDebug
+      console.error = origError
     }
     // Same consistency check as the single-byte oversize test: the log
     // must name the oversize condition and cite the actual byte count.

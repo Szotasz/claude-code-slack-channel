@@ -249,19 +249,22 @@ export interface SessionSupervisor {
 /** Structured log line emitted by the supervisor. `event` is a stable
  *  identifier (e.g. `session.activate`); `fields` carries the event's
  *  payload. Consumers are expected to inject their own writer; the
- *  default writes one newline-delimited JSON object per call to stdout
- *  so the journal sink (Epic 30-A) can tail the stream. */
+ *  default writes one newline-delimited JSON object per call to stderr.
+ *  Not stdout: in the plugin stdout is the MCP JSON-RPC stream, and a
+ *  line there that is not JSON-RPC is a protocol error for the client
+ *  (SLACKDUP1111: Claude Code logged "STDIO connection dropped" and an
+ *  invalid_union on `jsonrpc` at a session.activate line). */
 export type SupervisorLog = (event: string, fields: Record<string, unknown>) => void
 
 /** Injection points for a SessionSupervisor. All are optional; defaults
- *  give you a production-shaped supervisor that writes to stdout and
+ *  give you a production-shaped supervisor that writes to stderr and
  *  reads real wall-clock time. Tests supply their own `log` and `clock`
  *  to keep assertions deterministic. */
 export interface SupervisorOptions {
   /** State directory root, e.g. `~/.claude/channels/slack`. The same
    *  root passed to `sessionPath()` and `loadSession()` in lib.ts. */
   stateRoot: string
-  /** Optional structured log sink. Defaults to a stdout JSON-line
+  /** Optional structured log sink. Defaults to a stderr JSON-line
    *  writer. */
   log?: SupervisorLog
   /** Optional wall-clock source, returning epoch-ms. Defaults to
@@ -306,15 +309,14 @@ export function resolveIdleMs(env: Record<string, string | undefined> = process.
 }
 
 /** Default structured log writer: one newline-delimited JSON object per
- *  call, written to stdout. Matches the format the journal sink will
- *  tail. Keeping this internal means callers who want a different sink
+ *  call, written to stderr (stdout carries MCP JSON-RPC, see SupervisorLog).
+ *  Keeping this internal means callers who want a different sink
  *  just pass their own `log` — no global config. */
 function defaultLog(event: string, fields: Record<string, unknown>): void {
   const line = JSON.stringify({ event, ...fields })
-  // process.stdout.write is sync for TTYs, async for pipes; either way
-  // the supervisor does not await the flush. Structured logs are best-
+  // The supervisor does not await the flush. Structured logs are best-
   // effort; loss of a line is not a correctness issue.
-  process.stdout.write(`${line}\n`)
+  process.stderr.write(`${line}\n`)
 }
 
 /** Construct a SessionSupervisor bound to a state directory.
