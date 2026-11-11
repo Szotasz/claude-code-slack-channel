@@ -1936,8 +1936,16 @@ export function recordOwnPostTs(timestamps: Set<string>, ts: string, filePath: s
 // Event deduplication
 // ---------------------------------------------------------------------------
 
-/** How long a seen (channel, ts) pair stays in the dedup cache. */
-export const EVENT_DEDUP_TTL_MS = 60_000
+/** How long a seen (channel, ts) pair stays in the dedup cache.
+ *  SLACKDUP1111: 30 minutes, not 60 s. Slack redelivered one human message
+ *  six more times, 62 to 251 s apart (2026-11-11, 16:00-16:14 CET); every
+ *  copy fell outside a 60 s window and reached the session again. */
+export const EVENT_DEDUP_TTL_MS = 30 * 60_000
+
+/** Upper bound on the dedup cache. The oldest entry goes first (Map keeps
+ *  insertion order), so a burst cannot grow the cache or its file without
+ *  limit. 30 minutes of a busy multi-bot channel stays far below this. */
+export const SEEN_EVENTS_MAX = 5000
 
 /**
  * Detect and record a duplicate Slack event.
@@ -1960,9 +1968,10 @@ export function isDuplicateEvent(
   seen: Map<string, number>,
   now: number,
   ttlMs: number,
+  maxEntries: number = SEEN_EVENTS_MAX,
 ): boolean {
-  // Prune expired on every check. Cheap in practice — TTL is short and
-  // the Map only holds a few minutes of event history.
+  // Prune expired on every check. Cheap in practice: the Map holds at most
+  // SEEN_EVENTS_MAX keys (one TTL window of event history).
   for (const [key, expiresAt] of seen) {
     if (expiresAt <= now) seen.delete(key)
   }
@@ -1977,7 +1986,177 @@ export function isDuplicateEvent(
   if (seen.has(key)) return true
 
   seen.set(key, now + ttlMs)
+  while (seen.size > maxEntries) {
+    const oldest = seen.keys().next().value
+    if (oldest === undefined) break
+    seen.delete(oldest)
+  }
   return false
+}
+
+/** Slack's own delivery metadata for one Socket Mode event (the listener
+ *  arguments next to `event`). Unknown on purpose: it comes off the wire. */
+export interface InboundDelivery {
+  retryNum?: unknown
+  retryReason?: unknown
+  envelopeId?: unknown
+}
+
+/** The journal fields for one delivery (SLACKDUP1111): Slack's retry count,
+ *  retry reason and envelope id, each only when it has the expected shape.
+ *  No secret and no message text can pass: a number, and two short strings
+ *  limited to the characters Slack uses for them. */
+export function deliveryFields(
+  delivery: InboundDelivery | undefined,
+): Record<string, string | number> {
+  const d = delivery ?? {}
+  const out: Record<string, string | number> = {}
+  if (
+    typeof d.retryNum === 'number' &&
+    Number.isInteger(d.retryNum) &&
+    d.retryNum >= 0 &&
+    d.retryNum < 1000
+  ) {
+    out.retry_num = d.retryNum
+  }
+  if (typeof d.retryReason === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(d.retryReason)) {
+    out.retry_reason = d.retryReason
+  }
+  if (typeof d.envelopeId === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(d.envelopeId)) {
+    out.envelope_id = d.envelopeId
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Persisted dedup cache (SLACKDUP1111)
+// ---------------------------------------------------------------------------
+//
+// The dedup cache lives in the state dir as well, so a plugin restart inside
+// the window does not let a redelivered event through again. The file holds
+// only `<channel>:<ts>` keys and expiry times: no user, no text.
+
+export const SEEN_EVENTS_VERSION = 1
+export const SEEN_EVENTS_MAX_BYTES = 512 * 1024
+const SEEN_EVENT_KEY = /^[A-Za-z0-9]{1,32}:[0-9]{1,12}\.[0-9]{1,9}$/
+
+export interface SeenEventsLoad {
+  seen: Map<string, number>
+  status: 'ok' | 'missing' | 'refused'
+  /** rows that were not a valid key/expiry pair */
+  invalid: number
+  /** rows already past their expiry at load time */
+  expired: number
+  reason?: string
+}
+
+/**
+ * Reads the persisted dedup cache. Never throws. Opened without following a
+ * symlink, checked on the open descriptor (regular file, owner), read at most
+ * SEEN_EVENTS_MAX_BYTES + 1 bytes. Expired rows are skipped, at most
+ * SEEN_EVENTS_MAX rows are kept (the latest expiries), and an expiry further
+ * out than `now + ttlMs` is capped there, so a planted far-future row cannot
+ * mute a key for longer than one window.
+ */
+export function loadSeenEvents(
+  filePath: string,
+  now: number,
+  ttlMs: number = EVENT_DEDUP_TTL_MS,
+  opts: { uid?: number } = {},
+): SeenEventsLoad {
+  const empty = (status: SeenEventsLoad['status'], reason?: string): SeenEventsLoad => ({
+    seen: new Map(),
+    status,
+    invalid: 0,
+    expired: 0,
+    ...(reason ? { reason } : {}),
+  })
+  let raw: string
+  let fd: number | undefined
+  try {
+    if (!fsConstants.O_NOFOLLOW && lstatSync(filePath).isSymbolicLink()) {
+      return empty('refused', 'symlink')
+    }
+    fd = openSync(filePath, OPEN_FLAGS)
+    const st = fstatSync(fd)
+    if (!st.isFile()) return empty('refused', 'not_a_file')
+    if (opts.uid !== undefined && st.uid !== opts.uid) return empty('refused', 'foreign_owner')
+    const buf = Buffer.alloc(SEEN_EVENTS_MAX_BYTES + 1)
+    let n = 0
+    for (;;) {
+      const got = readSync(fd, buf, n, buf.length - n, null)
+      if (got <= 0) break
+      n += got
+      if (n >= buf.length) break
+    }
+    if (n > SEEN_EVENTS_MAX_BYTES) return empty('refused', 'too_big')
+    raw = buf.toString('utf-8', 0, n)
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code
+    if (code === 'ENOENT') return empty('missing')
+    if (code === 'ELOOP') return empty('refused', 'symlink')
+    return empty('refused', 'open_failed')
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+  let doc: unknown
+  try {
+    doc = JSON.parse(raw)
+  } catch {
+    return empty('refused', 'bad_json')
+  }
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc))
+    return empty('refused', 'bad_shape')
+  const { version, events } = doc as Record<string, unknown>
+  if (version !== SEEN_EVENTS_VERSION) return empty('refused', 'bad_version')
+  if (!Array.isArray(events)) return empty('refused', 'bad_shape')
+  const out: SeenEventsLoad = { seen: new Map(), status: 'ok', invalid: 0, expired: 0 }
+  const rows: [string, number][] = []
+  for (const row of events) {
+    if (!Array.isArray(row) || row.length !== 2) {
+      out.invalid++
+      continue
+    }
+    const [key, expiresAt] = row as unknown[]
+    if (
+      typeof key !== 'string' ||
+      !SEEN_EVENT_KEY.test(key) ||
+      typeof expiresAt !== 'number' ||
+      !Number.isFinite(expiresAt)
+    ) {
+      out.invalid++
+      continue
+    }
+    if (expiresAt <= now) {
+      out.expired++
+      continue
+    }
+    rows.push([key, Math.min(expiresAt, now + ttlMs)])
+  }
+  rows.sort((x, y) => x[1] - y[1])
+  for (const [key, expiresAt] of rows.slice(-SEEN_EVENTS_MAX)) out.seen.set(key, expiresAt)
+  return out
+}
+
+/** Writes the cache atomically: `<file>.tmp.<pid>` created 0o600 (exclusive),
+ *  chmod 0o600, then rename over the target. Throws on failure; the caller
+ *  logs it and keeps going (the in-memory cache still works). */
+export function saveSeenEvents(filePath: string, seen: ReadonlyMap<string, number>): void {
+  const json = `${JSON.stringify({ version: SEEN_EVENTS_VERSION, events: [...seen.entries()] })}\n`
+  const tmp = `${filePath}.tmp.${process.pid}`
+  try {
+    unlinkSync(tmp)
+  } catch {}
+  try {
+    writeFileSync(tmp, json, { mode: 0o600, flag: 'wx' })
+    chmodSync(tmp, 0o600)
+    renameSync(tmp, filePath)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {}
+    throw err
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -41,12 +41,14 @@ import {
   type DeliveredDm,
   decidePermissionRoute,
   defaultAccess,
+  deliveryFields,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
   formatVerifyResult,
   type GateResult,
+  type InboundDelivery,
   isDmChannelId,
   isDuplicateEvent,
   isSlackFileUrl,
@@ -58,6 +60,7 @@ import {
   listSessions as libListSessions,
   loadDeliveredDms,
   loadOwnThreads,
+  loadSeenEvents,
   matchPermissionReply,
   type PendingPolicyApproval,
   parseAnswerPress,
@@ -73,6 +76,7 @@ import {
   sanitizeDisplayName,
   sanitizeFilename,
   saveDeliveredDms,
+  saveSeenEvents,
   slackErrorFields,
   validateAnswerButtons,
   validateSendableRoots,
@@ -612,9 +616,43 @@ function rememberDeliveredDm(channel: string, user: string, access: Access): voi
   }
 }
 
-// Dedupe events across `message` and `app_mention` subscriptions. Keyed on
-// (channel, ts). See isDuplicateEvent in lib.ts for rationale.
-const seenEvents = new Map<string, number>()
+// Dedupe events across `message` and `app_mention` subscriptions, and against
+// Slack's own redelivery. Keyed on (channel, ts). See isDuplicateEvent in
+// lib.ts for rationale. SLACKDUP1111: the cache is kept in the state dir too
+// (keys and expiry times only), restored in main() before Socket Mode connects,
+// so a restart inside the window does not let a redelivered event through.
+const SEEN_EVENTS_FILE = join(STATE_DIR, 'seen-events.json')
+let seenEvents = new Map<string, number>()
+
+function restoreSeenEvents(): void {
+  const loaded = loadSeenEvents(SEEN_EVENTS_FILE, Date.now(), EVENT_DEDUP_TTL_MS, {
+    uid: typeof process.getuid === 'function' ? process.getuid() : undefined,
+  })
+  seenEvents = loaded.seen
+  const entry = {
+    event: 'seen_events_load',
+    status: loaded.status,
+    kept: loaded.seen.size,
+    invalid: loaded.invalid,
+    expired: loaded.expired,
+    ...(loaded.reason ? { reason: loaded.reason } : {}),
+  }
+  gateLog.append(entry)
+  if (loaded.status === 'refused' || loaded.invalid > 0) {
+    console.error('[slack] seen-events.json was not fully trusted', entry)
+  }
+}
+
+function persistSeenEvents(): void {
+  try {
+    saveSeenEvents(SEEN_EVENTS_FILE, seenEvents)
+  } catch (err) {
+    // Best effort: the in-memory cache still dedups for this process.
+    const message = err instanceof Error ? err.message : String(err)
+    console.error('[slack] seen-events.json write failed', message)
+    gateLog.append({ event: 'seen_events_save_failed', message: message.slice(0, 200) })
+  }
+}
 
 // Per-channel read cache for `read_peer_manifests` (Epic 31-A.5). Five-minute
 // TTL doubles as the rate limit on pins.list / conversations.history — within
@@ -2554,7 +2592,7 @@ export async function activateAndTouch(
 async function deliverEvent(
   ev: Record<string, unknown>,
   access: Access,
-  opts: { viaButton?: boolean } = {},
+  opts: { viaButton?: boolean; delivery?: InboundDelivery } = {},
 ): Promise<void> {
   // Audit log for delivered bot messages (diagnostics for multi-agent flows)
   if (ev.bot_id) {
@@ -2588,6 +2626,8 @@ async function deliverEvent(
       channel: channelId,
       user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
       thread_ts: incomingThreadTs,
+      ts: ev.ts as string | undefined,
+      ...deliveryFields(opts.delivery),
     },
   })
 
@@ -2777,12 +2817,28 @@ async function deliverEvent(
   })
 }
 
-async function handleMessage(event: unknown): Promise<void> {
+async function handleMessage(event: unknown, delivery: InboundDelivery = {}): Promise<void> {
   const ev = event as Record<string, unknown>
 
   // Skip duplicates (message + app_mention fire for the same @-mentioned
-  // channel message; Slack also occasionally redelivers on slow acks).
-  if (isDuplicateEvent(ev, seenEvents, Date.now(), EVENT_DEDUP_TTL_MS)) return
+  // channel message; Slack also redelivers, SLACKDUP1111: six more copies of
+  // one message, 62 to 251 s apart). A skipped copy is journaled with Slack's
+  // retry fields so the next case shows why Slack sent it again.
+  if (isDuplicateEvent(ev, seenEvents, Date.now(), EVENT_DEDUP_TTL_MS)) {
+    journalWrite({
+      kind: 'gate.inbound.drop',
+      outcome: 'drop',
+      actor: ev.bot_id ? 'peer_agent' : 'session_owner',
+      reason: 'duplicate',
+      input: {
+        channel: ev.channel as string,
+        ts: ev.ts as string,
+        ...deliveryFields(delivery),
+      },
+    })
+    return
+  }
+  persistSeenEvents()
 
   const result = await gate(event)
   switch (result.action) {
@@ -2825,7 +2881,7 @@ async function handleMessage(event: unknown): Promise<void> {
     }
 
     case 'deliver': {
-      await deliverEvent(ev, result.access!)
+      await deliverEvent(ev, result.access!, { delivery })
     }
   }
 }
@@ -2834,22 +2890,30 @@ async function handleMessage(event: unknown): Promise<void> {
 // Socket Mode event routing
 // ---------------------------------------------------------------------------
 
-socket.on('message', async ({ event, ack }) => {
+socket.on('message', async ({ event, ack, retry_num, retry_reason, envelope_id }) => {
   await ack()
   if (!event) return
   try {
-    await handleMessage(event)
+    await handleMessage(event, {
+      retryNum: retry_num,
+      retryReason: retry_reason,
+      envelopeId: envelope_id,
+    })
   } catch (err) {
     console.error('[slack] Error handling message:', err)
   }
 })
 
 // Also listen for app_mention events (used in channels with requireMention)
-socket.on('app_mention', async ({ event, ack }) => {
+socket.on('app_mention', async ({ event, ack, retry_num, retry_reason, envelope_id }) => {
   await ack()
   if (!event) return
   try {
-    await handleMessage(event)
+    await handleMessage(event, {
+      retryNum: retry_num,
+      retryReason: retry_reason,
+      envelopeId: envelope_id,
+    })
   } catch (err) {
     console.error('[slack] Error handling mention:', err)
   }
@@ -3021,6 +3085,10 @@ async function main(): Promise<void> {
   // SLACKOUTDM1007 (2): before Socket Mode and the MCP transport connect, so
   // the first send after a restart already knows the allowFrom users' DMs.
   restoreDeliveredDms()
+
+  // SLACKDUP1111: the dedup cache from before a restart, before Socket Mode
+  // connects, so the first redelivered copy is already recognised.
+  restoreSeenEvents()
 
   // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is
   // older than idleMs and no in-flight work, and drives quiesce → deactivate.

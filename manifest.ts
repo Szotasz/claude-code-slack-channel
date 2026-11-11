@@ -249,7 +249,8 @@ export function extractManifests(texts: ReadonlyArray<string | null | undefined>
     // and not a signal.
     const bytes = utf8ByteLength(text)
     if (bytes > MAX_MANIFEST_BYTES) {
-      console.debug(`[manifest] silent drop: oversized body ${bytes}B > ${MAX_MANIFEST_BYTES}B cap`)
+      // stderr, not console.debug: stdout is the MCP JSON-RPC stream (SLACKDUP1111).
+      console.error(`[manifest] silent drop: oversized body ${bytes}B > ${MAX_MANIFEST_BYTES}B cap`)
       return []
     }
     try {
