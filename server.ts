@@ -1408,7 +1408,12 @@ async function executeDownloadAttachment(
   }
 
   const paths: string[] = []
+  // ATTACHNAME1117: copy-pasted images all arrive as "image.png"; without a
+  // per-file index every file of one message lands on the same path and only
+  // the last one survives. The 1-based position in msg.files keeps them apart.
+  let fileIndex = 0
   for (const file of msg.files) {
+    fileIndex += 1
     const url = file.url_private_download || file.url_private
     if (!url) continue
 
@@ -1420,7 +1425,7 @@ async function executeDownloadAttachment(
     if (!isSlackFileUrl(url)) continue
 
     const safeName = sanitizeFilename(file.name || `file_${Date.now()}`)
-    const outPath = join(ctx.INBOX_DIR, `${messageTs.replace('.', '_')}_${safeName}`)
+    const outPath = join(ctx.INBOX_DIR, `${messageTs.replace('.', '_')}_${fileIndex}_${safeName}`)
 
     const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${ctx.botToken}` },
