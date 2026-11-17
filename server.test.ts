@@ -1848,6 +1848,18 @@ describe('SLACKOUTDM1007 (2) wiring in server.ts', () => {
       expect(body).not.toContain('assertOutboundAllowedNoDm')
     }
   })
+  // ATTACHNAME1117: copy-pasted images all arrive named "image.png". Without a
+  // per-file index every file of one message was written to the same inbox
+  // path and only the last one survived.
+  test('download_attachment gives same-named files of one message distinct paths', () => {
+    const start = src.indexOf('async function executeDownloadAttachment(')
+    expect(start).toBeGreaterThan(0)
+    const body = src.slice(start, src.indexOf('\n}\n', start))
+    expect(body).toContain('fileIndex += 1')
+    expect(body).toMatch(
+      /INBOX_DIR, `\$\{messageTs\.replace\('\.', '_'\)\}_\$\{fileIndex\}_\$\{safeName\}`/,
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
