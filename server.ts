@@ -2425,6 +2425,7 @@ async function handleAnswerPress(
       kind: 'gate.inbound.drop',
       outcome: 'drop',
       actor: 'session_owner',
+      ...(result.reason ? { reason: result.reason } : {}),
       input: { channel: press.channel, user: press.userId },
     })
     try {
@@ -2852,9 +2853,11 @@ async function handleMessage(event: unknown, delivery: InboundDelivery = {}): Pr
         kind: 'gate.inbound.drop',
         outcome: 'drop',
         actor: ev.bot_id ? 'peer_agent' : 'session_owner',
+        ...(result.reason ? { reason: result.reason } : {}),
         input: {
           channel: ev.channel as string,
           user: ev.user as string | undefined,
+          ...(result.botMentioned !== undefined ? { botMentioned: result.botMentioned } : {}),
         },
       })
       return

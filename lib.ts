@@ -129,11 +129,37 @@ export interface Access {
 
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
+/** Why gate() dropped an event. Journaled with `gate.inbound.drop`, so an
+ *  operator (or a dashboard watcher) can tell "this channel is not opted in"
+ *  from "the sender is not on allowFrom" without re-deriving the gate. */
+export type DropReason =
+  | 'self-echo'
+  | 'bot-not-allowed'
+  | 'bot-permission-reply'
+  | 'subtype'
+  | 'no-user'
+  | 'dm-not-allowed'
+  | 'pairing-reply-cap'
+  | 'pairing-pending-cap'
+  | 'channel-not-allowed'
+  | 'sender-not-allowed'
+  | 'mention-required'
+  | 'addressed-to-others'
+  | 'peer-thread'
+  | 'peer-addressed-thread'
+  | 'answer-press-not-allowed'
+
 export interface GateResult {
   action: GateAction
   access?: Access
   code?: string
   isResend?: boolean
+  /** Set on every `drop`. */
+  reason?: DropReason
+  /** Channel (non-DM) drops only: whether the message @-mentioned this bot.
+   *  "Someone tagged the bot in a channel it does not read" is the signal a
+   *  channel opt-in request is built from. */
+  botMentioned?: boolean
 }
 
 /** Identity of a thread-scoped session. See 000-docs/session-state-machine.md.
@@ -1570,7 +1596,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
     (opts.selfBotId && ev.bot_id === opts.selfBotId) ||
     (opts.selfAppId && botProfile.app_id === opts.selfAppId) ||
     (ev.user && ev.user === opts.botUserId)
-  if (isSelfEcho) return { action: 'drop' }
+  if (isSelfEcho) return { action: 'drop', reason: 'self-echo' }
 
   // Per-channel opt-in: only deliver if the channel explicitly lists this
   // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
@@ -1578,7 +1604,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   const policy = opts.access.channels[channel]
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
-    return { action: 'drop' }
+    return { action: 'drop', reason: 'bot-not-allowed' }
   }
 
   // Belt-and-suspenders: drop peer-bot messages that look like permission
@@ -1586,7 +1612,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   // peer bots from approving tool calls, but this gate-level check prevents
   // regression if that guard is ever loosened.
   const text = ((ev.text as string) || '').trim()
-  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
+  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop', reason: 'bot-permission-reply' }
 
   // Fall through to normal access-control checks (subtype, allowFrom,
   // requireMention). The channel policy's allowFrom and requireMention
@@ -1606,7 +1632,7 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
     return { action: 'deliver', access }
   }
   if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
-    return { action: 'drop' }
+    return { action: 'drop', reason: 'dm-not-allowed' }
   }
 
   // Pairing mode — check if there's already a pending code for this user
@@ -1617,13 +1643,13 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
         if (!staticMode) saveAccess(access)
         return { action: 'pair', code, isResend: true }
       }
-      return { action: 'drop' } // Hit reply cap
+      return { action: 'drop', reason: 'pairing-reply-cap' }
     }
   }
 
   // Cap total pending
   if (Object.keys(access.pending).length >= MAX_PENDING) {
-    return { action: 'drop' }
+    return { action: 'drop', reason: 'pairing-pending-cap' }
   }
 
   // Generate new pairing code
@@ -1650,10 +1676,15 @@ async function handleChannelEvent(
   const { access, botUserId } = opts
   const channel = ev.channel as string
   const policy = access.channels[channel]
-  if (!policy) return { action: 'drop' }
+  const drop = (reason: DropReason): GateResult => ({
+    action: 'drop',
+    reason,
+    botMentioned: isMentioned(ev, botUserId),
+  })
+  if (!policy) return drop('channel-not-allowed')
 
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
-    return { action: 'drop' }
+    return drop('sender-not-allowed')
   }
 
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
@@ -1675,7 +1706,7 @@ async function handleChannelEvent(
           addressedToOthers(ev, botUserId, policy.mentionPeers)
         ) &&
           (await rootMentionsSelf(ev, channel, threadTs, opts))))
-    if (!autoDeliver) return { action: 'drop' }
+    if (!autoDeliver) return drop('mention-required')
   }
 
   const skipOthers = policy.skipWhenOthersMentioned ?? (policy.mentionPeers?.length ?? 0) > 0
@@ -1684,7 +1715,7 @@ async function handleChannelEvent(
     skipOthers &&
     addressedToOthers(ev, botUserId, policy.mentionPeers)
   ) {
-    return { action: 'drop' }
+    return drop('addressed-to-others')
   }
 
   // A thread reply under ANOTHER agent's post belongs to that agent's
@@ -1692,7 +1723,7 @@ async function handleChannelEvent(
   // in Iris's thread must not wake Zara, who reads everything. Same switch as
   // above; a tag of this bot in the reply still delivers.
   if (!policy.requireMention && skipOthers && inPeerThread(ev, botUserId, policy.mentionPeers)) {
-    return { action: 'drop' }
+    return drop('peer-thread')
   }
 
   // SLACKTHREADROOT1109: the same for a thread a HUMAN started by tagging a
@@ -1704,7 +1735,7 @@ async function handleChannelEvent(
     skipOthers &&
     (await inPeerAddressedThread(ev, channel, botUserId, policy.mentionPeers, opts))
   ) {
-    return { action: 'drop' }
+    return drop('peer-addressed-thread')
   }
 
   return { action: 'deliver', access }
@@ -1773,10 +1804,10 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   }
 
   // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop' }
+  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop', reason: 'subtype' }
 
   // 3. No user ID = drop
-  if (!ev.user) return { action: 'drop' }
+  if (!ev.user) return { action: 'drop', reason: 'no-user' }
 
   // 4. DM handling
   if (ev.channel_type === 'im') return handleDmEvent(ev, opts)
@@ -2838,7 +2869,7 @@ export async function answerPressGate(
 ): Promise<{ event: Record<string, unknown>; result: GateResult }> {
   const event = answerPressEvent(press, opts.botUserId)
   if (event.channel_type === 'im' && !opts.access.allowFrom.includes(press.userId)) {
-    return { event, result: { action: 'drop' } }
+    return { event, result: { action: 'drop', reason: 'answer-press-not-allowed' } }
   }
   return { event, result: await gate(event, opts) }
 }
